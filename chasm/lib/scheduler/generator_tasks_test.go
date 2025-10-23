@@ -25,7 +25,7 @@ func TestGeneratorTasksSuite(t *testing.T) {
 }
 
 func (s *generatorTasksSuite) SetupTest() {
-	s.SetupSuite()
+	s.schedulerSuite.SetupTest()
 	s.executor = scheduler.NewGeneratorTaskExecutor(scheduler.GeneratorTaskExecutorOptions{
 		Config:         defaultConfig(),
 		MetricsHandler: metrics.NoopMetricsHandler,
@@ -40,7 +40,7 @@ func (s *generatorTasksSuite) TestExecute_ProcessTimeRangeFails() {
 
 	// If ProcessTimeRange fails, we should fail the task as an internal error.
 	s.specProcessor.EXPECT().ProcessTimeRange(
-		gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+		gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
 	).Return(nil, errors.New("processTimeRange bug"))
 
 	// Execute the generate task.
@@ -75,6 +75,11 @@ func (s *generatorTasksSuite) TestExecuteBufferTask_Basic() {
 	s.NoError(err)
 	s.Equal(5, len(invoker.BufferedStarts))
 
+	// Validate RequestId -> WorkflowId mapping
+	for _, start := range invoker.BufferedStarts {
+		s.Equal(start.WorkflowId, invoker.WorkflowID(start.RequestId))
+	}
+
 	// Generator's high water mark should have advanced.
 	newHighWatermark := generator.LastProcessedTime.AsTime()
 	s.True(newHighWatermark.After(highWatermark))
@@ -82,8 +87,5 @@ func (s *generatorTasksSuite) TestExecuteBufferTask_Basic() {
 	// Ensure we scheduled an immediate physical pure task on the tree.
 	_, err = s.node.CloseTransaction()
 	s.NoError(err)
-	s.Equal(1, len(s.addedTasks))
-	task, ok := s.addedTasks[0].(*tasks.ChasmTaskPure)
-	s.True(ok)
-	s.Equal(chasm.TaskScheduledTimeImmediate, task.GetVisibilityTime())
+	s.True(s.hasTask(&tasks.ChasmTaskPure{}, chasm.TaskScheduledTimeImmediate))
 }

@@ -10,6 +10,7 @@ import (
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/metrics"
 	"go.uber.org/fx"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -74,7 +75,15 @@ func (g *GeneratorTaskExecutor) Execute(
 		t2 = t1
 	}
 
-	result, err := g.SpecProcessor.ProcessTimeRange(scheduler, t1, t2, scheduler.overlapPolicy(), "", false, nil)
+	result, err := g.SpecProcessor.ProcessTimeRange(
+		scheduler,
+		t1, t2,
+		scheduler.overlapPolicy(),
+		scheduler.WorkflowID(),
+		"",
+		false,
+		nil,
+	)
 	if err != nil {
 		// An error here should be impossible, send to the DLQ.
 		logger.Error("error processing time range", tag.Error(err))
@@ -102,7 +111,9 @@ func (g *GeneratorTaskExecutor) Execute(
 		// Once the idle timer expires, we close the component.
 		ctx.AddTask(scheduler, chasm.TaskAttributes{
 			ScheduledTime: idleExpiration,
-		}, &schedulerpb.SchedulerIdleTask{})
+		}, &schedulerpb.SchedulerIdleTask{
+			IdleTimeTotal: durationpb.New(idleTimeTotal),
+		})
 		return nil
 	}
 

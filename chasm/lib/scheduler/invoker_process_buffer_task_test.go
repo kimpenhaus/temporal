@@ -13,7 +13,6 @@ import (
 	"go.temporal.io/server/chasm/lib/scheduler/gen/schedulerpb/v1"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/util"
-	"go.temporal.io/server/service/history/tasks"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -27,8 +26,7 @@ func TestInvokerProcessBufferTaskSuite(t *testing.T) {
 }
 
 func (s *invokerProcessBufferTaskSuite) SetupTest() {
-	s.SetupSuite()
-
+	s.schedulerSuite.SetupTest()
 	s.executor = scheduler.NewInvokerProcessBufferTaskExecutor(scheduler.InvokerTaskExecutorOptions{
 		Config:         defaultConfig(),
 		MetricsHandler: metrics.NoopMetricsHandler,
@@ -312,9 +310,6 @@ func (s *invokerProcessBufferTaskSuite) runProcessBufferTestCase(c *processBuffe
 
 	// Set LastProcessedTime to current time to ensure time checks pass
 	invoker.LastProcessedTime = timestamppb.New(s.timeSource.Now())
-
-	// Clear old tasks and run the process buffer task
-	s.addedTasks = make([]tasks.Task, 0)
 
 	err = s.executor.Execute(ctx, invoker, chasm.TaskAttributes{}, &schedulerpb.InvokerProcessBufferTask{})
 	s.NoError(err)
