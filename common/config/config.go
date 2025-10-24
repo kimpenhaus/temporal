@@ -484,6 +484,7 @@ type (
 		Filestore *FilestoreArchiver `yaml:"filestore"`
 		Gstorage  *GstorageArchiver  `yaml:"gstorage"`
 		S3store   *S3Archiver        `yaml:"s3store"`
+		Azure     *AzureArchiver     `yaml:"azure"`
 	}
 
 	// VisibilityArchival contains the config for visibility archival
@@ -501,6 +502,7 @@ type (
 		Filestore *FilestoreArchiver `yaml:"filestore"`
 		S3store   *S3Archiver        `yaml:"s3store"`
 		Gstorage  *GstorageArchiver  `yaml:"gstorage"`
+		Azure     *AzureArchiver     `yaml:"azure"`
 	}
 
 	// FilestoreArchiver contain the config for filestore archiver
@@ -520,6 +522,30 @@ type (
 		Endpoint         *string `yaml:"endpoint"`
 		S3ForcePathStyle bool    `yaml:"s3ForcePathStyle"`
 		LogLevel         uint    `yaml:"logLevel"`
+	}
+
+	// AzureArchiver contains the config for Azure Blob Storage archiver
+	AzureArchiver struct {
+		AccountName   string `yaml:"accountName"`
+		ContainerName string `yaml:"containerName"`
+
+		// optional
+		Endpoint string `yaml:"endpoint"`
+
+		// default - recommended on production systems
+		// environment variables: AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
+
+		// shared_key
+		AccountKey string `yaml:"accountKey"`
+
+		// sas
+		SASToken string `yaml:"sasToken"`
+
+		// managed_identity
+		ManagedIdentityClientID string `yaml:"managedIdentityClientID"`
+
+		// connection_string
+		ConnectionString string `yaml:"connectionString"`
 	}
 
 	// PublicClient is the config for internal nodes (history/matching/worker) connecting to

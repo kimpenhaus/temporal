@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"go.temporal.io/server/common/archiver"
+	"go.temporal.io/server/common/archiver/azure"
 	"go.temporal.io/server/common/archiver/filestore"
 	"go.temporal.io/server/common/archiver/gcloud"
 	"go.temporal.io/server/common/archiver/s3store"
@@ -80,19 +81,21 @@ func (p *archiverProvider) GetHistoryArchiver(scheme string) (historyArchiver ar
 			return nil, ErrArchiverConfigNotFound
 		}
 		historyArchiver, err = filestore.NewHistoryArchiver(p.executionManager, p.logger, p.metricsHandler, p.historyArchiverConfigs.Filestore)
-
 	case gcloud.URIScheme:
 		if p.historyArchiverConfigs.Gstorage == nil {
 			return nil, ErrArchiverConfigNotFound
 		}
-
 		historyArchiver, err = gcloud.NewHistoryArchiver(p.executionManager, p.logger, p.metricsHandler, p.historyArchiverConfigs.Gstorage)
-
 	case s3store.URIScheme:
 		if p.historyArchiverConfigs.S3store == nil {
 			return nil, ErrArchiverConfigNotFound
 		}
 		historyArchiver, err = s3store.NewHistoryArchiver(p.executionManager, p.logger, p.metricsHandler, p.historyArchiverConfigs.S3store)
+	case azure.URIScheme:
+		if p.historyArchiverConfigs.Azure == nil {
+			return nil, ErrArchiverConfigNotFound
+		}
+		historyArchiver, err = azure.NewHistoryArchiver(p.executionManager, p.logger, p.metricsHandler, p.historyArchiverConfigs.Azure)
 	default:
 		return nil, ErrUnknownScheme
 	}
@@ -137,7 +140,11 @@ func (p *archiverProvider) GetVisibilityArchiver(scheme string) (archiver.Visibi
 			return nil, ErrArchiverConfigNotFound
 		}
 		visibilityArchiver, err = gcloud.NewVisibilityArchiver(p.logger, p.metricsHandler, p.visibilityArchiverConfigs.Gstorage)
-
+	case azure.URIScheme:
+		if p.visibilityArchiverConfigs.Azure == nil {
+			return nil, ErrArchiverConfigNotFound
+		}
+		visibilityArchiver, err = azure.NewVisibilityArchiver(p.logger, p.metricsHandler, p.visibilityArchiverConfigs.Azure)
 	default:
 		return nil, ErrUnknownScheme
 	}
@@ -152,5 +159,4 @@ func (p *archiverProvider) GetVisibilityArchiver(scheme string) (archiver.Visibi
 	}
 	p.visibilityArchivers[scheme] = visibilityArchiver
 	return visibilityArchiver, nil
-
 }
