@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	commonpb "go.temporal.io/api/common/v1"
 	schedulepb "go.temporal.io/api/schedule/v1"
 	workflowpb "go.temporal.io/api/workflow/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
@@ -12,8 +13,11 @@ import (
 	"go.temporal.io/server/chasm/lib/scheduler"
 	"go.temporal.io/server/common/backoff"
 	"go.temporal.io/server/common/clock"
+	"go.temporal.io/server/common/log"
+	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/testing/testlogger"
 	"go.temporal.io/server/common/testing/testvars"
+	legacyscheduler "go.temporal.io/server/service/worker/scheduler"
 	"go.uber.org/mock/gomock"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
@@ -42,7 +46,8 @@ func defaultSchedule() *schedulepb.Schedule {
 		Action: &schedulepb.ScheduleAction{
 			Action: &schedulepb.ScheduleAction_StartWorkflow{
 				StartWorkflow: &workflowpb.NewWorkflowExecutionInfo{
-					WorkflowId: "scheduled-wf",
+					WorkflowId:   "scheduled-wf",
+					WorkflowType: &commonpb.WorkflowType{Name: "scheduled-wf-type"},
 				},
 			},
 		},
@@ -71,14 +76,63 @@ func defaultConfig() *scheduler.Config {
 	}
 }
 
+func newTestLibrary(logger log.Logger, specProcessor scheduler.SpecProcessor) *scheduler.Library {
+	config := defaultConfig()
+	specBuilder := legacyscheduler.NewSpecBuilder()
+	invokerOpts := scheduler.InvokerTaskExecutorOptions{
+		Config:         config,
+		MetricsHandler: metrics.NoopMetricsHandler,
+		BaseLogger:     logger,
+		SpecProcessor:  specProcessor,
+	}
+	return scheduler.NewLibrary(
+		nil,
+		scheduler.NewSchedulerIdleTaskExecutor(scheduler.SchedulerIdleTaskExecutorOptions{
+			Config: config,
+		}),
+		scheduler.NewGeneratorTaskExecutor(scheduler.GeneratorTaskExecutorOptions{
+			Config:         config,
+			MetricsHandler: metrics.NoopMetricsHandler,
+			BaseLogger:     logger,
+			SpecProcessor:  specProcessor,
+			SpecBuilder:    specBuilder,
+		}),
+		scheduler.NewInvokerExecuteTaskExecutor(invokerOpts),
+		scheduler.NewInvokerProcessBufferTaskExecutor(invokerOpts),
+		scheduler.NewBackfillerTaskExecutor(scheduler.BackfillerTaskExecutorOptions{
+			Config:         config,
+			MetricsHandler: metrics.NoopMetricsHandler,
+			BaseLogger:     logger,
+			SpecProcessor:  specProcessor,
+		}),
+	)
+}
+
 func setupSchedulerForTest(t *testing.T) (*scheduler.Scheduler, chasm.MutableContext, *chasm.Node) {
-	controller := gomock.NewController(t)
-	nodeBackend := chasm.NewMockNodeBackend(controller)
+	nodeBackend := &chasm.MockNodeBackend{}
 	logger := testlogger.NewTestLogger(t, testlogger.FailOnExpectedErrorOnly)
 	nodePathEncoder := chasm.DefaultPathEncoder
 
+	// Create mock spec processor with default expectations for setup.
+	ctrl := gomock.NewController(t)
+	specProcessor := scheduler.NewMockSpecProcessor(ctrl)
+	specProcessor.EXPECT().ProcessTimeRange(
+		gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+	).Return(&scheduler.ProcessedTimeRange{
+		NextWakeupTime: time.Now().Add(time.Hour),
+		LastActionTime: time.Now(),
+	}, nil).AnyTimes()
+	specProcessor.EXPECT().NextTime(gomock.Any(), gomock.Any()).Return(legacyscheduler.GetNextTimeResult{
+		Next:    time.Now().Add(time.Hour),
+		Nominal: time.Now().Add(time.Hour),
+	}, nil).AnyTimes()
+
 	registry := chasm.NewRegistry(logger)
-	err := registry.Register(&scheduler.Library{})
+	err := registry.Register(&chasm.CoreLibrary{})
+	if err != nil {
+		t.Fatalf("failed to register core library: %v", err)
+	}
+	err = registry.Register(newTestLibrary(logger, specProcessor))
 	if err != nil {
 		t.Fatalf("failed to register scheduler library: %v", err)
 	}
@@ -87,17 +141,16 @@ func setupSchedulerForTest(t *testing.T) (*scheduler.Scheduler, chasm.MutableCon
 	timeSource.Update(time.Now())
 
 	tv := testvars.New(t)
-	nodeBackend.EXPECT().NextTransitionCount().Return(int64(2)).AnyTimes()
-	nodeBackend.EXPECT().GetCurrentVersion().Return(int64(1)).AnyTimes()
-	nodeBackend.EXPECT().UpdateWorkflowStateStatus(gomock.Any(), gomock.Any()).Return(true, nil).AnyTimes()
-	nodeBackend.EXPECT().GetWorkflowKey().Return(tv.Any().WorkflowKey()).AnyTimes()
-	nodeBackend.EXPECT().IsWorkflow().Return(false).AnyTimes()
-	currentVT := &persistencespb.VersionedTransition{
-		NamespaceFailoverVersion: 1,
-		TransitionCount:          1,
+	nodeBackend.HandleNextTransitionCount = func() int64 { return 2 }
+	nodeBackend.HandleGetCurrentVersion = func() int64 { return 1 }
+	nodeBackend.HandleGetWorkflowKey = tv.Any().WorkflowKey
+	nodeBackend.HandleIsWorkflow = func() bool { return false }
+	nodeBackend.HandleCurrentVersionedTransition = func() *persistencespb.VersionedTransition {
+		return &persistencespb.VersionedTransition{
+			NamespaceFailoverVersion: 1,
+			TransitionCount:          1,
+		}
 	}
-	nodeBackend.EXPECT().CurrentVersionedTransition().Return(currentVT).AnyTimes()
-	nodeBackend.EXPECT().AddTasks(gomock.Any()).Return().AnyTimes()
 
 	node := chasm.NewEmptyTree(registry, timeSource, nodeBackend, nodePathEncoder, logger)
 	ctx := chasm.NewMutableContext(context.Background(), node)

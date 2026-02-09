@@ -22,7 +22,7 @@ import (
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/persistence/visibility/store/elasticsearch/client"
-	"go.temporal.io/server/common/searchattribute"
+	"go.temporal.io/server/common/searchattribute/sadefs"
 )
 
 type (
@@ -170,7 +170,7 @@ func (p *processorImpl) Add(request *client.BulkableRequest, visibilityTaskKey s
 			p.logger.Fatal(fmt.Sprintf("mapToAckFuture has item of a wrong type %T (%T expected).", value, &ackFuture{}), tag.Value(key))
 		}
 
-		p.logger.Warn("Skipping duplicate ES request for visibility task key.", tag.Key(visibilityTaskKey), tag.ESDocID(request.ID), tag.Value(request.Doc), tag.NewDurationTag("interval-between-duplicates", newFuture.createdAt.Sub(existingFuture.createdAt)))
+		p.logger.Warn("Skipping duplicate ES request for visibility task key.", tag.Key(visibilityTaskKey), tag.ESDocID(request.ID), tag.Value(request.Doc), tag.Duration("interval-between-duplicates", newFuture.createdAt.Sub(existingFuture.createdAt)))
 		metrics.ElasticsearchBulkProcessorDuplicateRequest.With(p.metricsHandler).Record(1)
 		newFuture = existingFuture
 		return nil
@@ -320,7 +320,7 @@ func (p *processorImpl) extractVisibilityTaskKey(request elastic.BulkableRequest
 			return ""
 		}
 
-		k, ok := body[searchattribute.VisibilityTaskKey]
+		k, ok := body[sadefs.VisibilityTaskKey]
 		if !ok {
 			p.logger.Error("Unable to extract VisibilityTaskKey from ES request.", tag.ESRequest(request.String()))
 			metrics.ElasticsearchBulkProcessorCorruptedData.With(p.metricsHandler).Record(1)

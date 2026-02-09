@@ -29,6 +29,7 @@ import (
 	"go.temporal.io/server/api/matchingservice/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	taskqueuespb "go.temporal.io/server/api/taskqueue/v1"
+	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/searchattribute"
 	"go.temporal.io/server/common/tqid"
@@ -64,6 +65,7 @@ func (s *VersioningIntegSuite) SetupSuite() {
 		dynamicconfig.FrontendEnableWorkerVersioningRuleAPIs.Key():     true,
 		dynamicconfig.MatchingForwarderMaxChildrenPerNode.Key():        partitionTreeDegree,
 		dynamicconfig.TaskQueuesPerBuildIdLimit.Key():                  3,
+		dynamicconfig.EnableWorkflowTaskStampIncrementOnFailure.Key():  true,
 
 		dynamicconfig.AssignmentRuleLimitPerQueue.Key():              10,
 		dynamicconfig.RedirectRuleLimitPerQueue.Key():                10,
@@ -773,6 +775,7 @@ func (s *VersioningIntegSuite) unversionedWorkflowStaysUnversioned() {
 }
 
 func (s *VersioningIntegSuite) TestFirstWorkflowTaskAssignment_Spooled() {
+	s.T().Skip("Skipping test since rules based versioning is soon to be deprecated")
 	s.RunTestWithMatchingBehavior(s.firstWorkflowTaskAssignmentSpooled)
 }
 
@@ -885,6 +888,7 @@ func (s *VersioningIntegSuite) firstWorkflowTaskAssignmentSpooled() {
 }
 
 func (s *VersioningIntegSuite) TestFirstWorkflowTaskAssignment_SyncMatch() {
+	s.T().Skip("Skipping test since rules based versioning is soon to be deprecated")
 	s.RunTestWithMatchingBehavior(s.firstWorkflowTaskAssignmentSyncMatch)
 }
 
@@ -4977,6 +4981,7 @@ func (s *VersioningIntegSuite) getStickyQueueName(ctx context.Context, id string
 	ms, err := s.AdminClient().DescribeMutableState(ctx, &adminservice.DescribeMutableStateRequest{
 		Namespace: s.Namespace().String(),
 		Execution: &commonpb.WorkflowExecution{WorkflowId: id},
+		Archetype: chasm.WorkflowArchetype,
 	})
 	s.NoError(err)
 	return ms.DatabaseMutableState.ExecutionInfo.StickyTaskQueue

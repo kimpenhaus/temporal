@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/nexus-rpc/sdk-go/nexus"
-	"github.com/pborman/uuid"
 	"github.com/stretchr/testify/suite"
 	commandpb "go.temporal.io/api/command/v1"
 	commonpb "go.temporal.io/api/common/v1"
@@ -121,7 +121,7 @@ func (s *NexusStateReplicationSuite) TestNexusOperationEventsReplicated() {
 	ns := s.createGlobalNamespace()
 	endpointName := testcore.RandomizedNexusEndpoint(s.T().Name())
 
-	// Set URL template after httpAPAddress is set, see commonnexus.RouteCompletionCallback.
+	// Set URL template after httpAPIAddress is set, see commonnexus.RouteCompletionCallback.
 	for _, cluster := range s.clusters {
 		cluster.OverrideDynamicConfig(
 			s.T(),
@@ -274,7 +274,7 @@ func (s *NexusStateReplicationSuite) TestNexusOperationCancelationReplicated() {
 	ns := s.createGlobalNamespace()
 	endpointName := testcore.RandomizedNexusEndpoint(s.T().Name())
 
-	// Set URL template after httpAPAddress is set, see commonnexus.RouteCompletionCallback.
+	// Set URL template after httpAPIAddress is set, see commonnexus.RouteCompletionCallback.
 	// We don't actually want to deliver callbacks in this test, the config just has to be set for nexus task execution.
 	for _, cluster := range s.clusters {
 		cluster.OverrideDynamicConfig(
@@ -431,7 +431,7 @@ func (s *NexusStateReplicationSuite) TestNexusCallbackReplicated() {
 		WorkflowId:   tv.WorkflowID(),
 		WorkflowType: tv.WorkflowType(),
 		TaskQueue:    tv.TaskQueue(),
-		RequestId:    uuid.New(),
+		RequestId:    uuid.NewString(),
 		CompletionCallbacks: []*commonpb.Callback{
 			{
 				Variant: &commonpb.Callback_Nexus_{

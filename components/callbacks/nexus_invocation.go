@@ -20,7 +20,8 @@ import (
 	"go.temporal.io/server/common/namespace"
 	commonnexus "go.temporal.io/server/common/nexus"
 	"go.temporal.io/server/common/nexus/nexusrpc"
-	"go.temporal.io/server/service/history/queues"
+	queuescommon "go.temporal.io/server/service/history/queues/common"
+	queueserrors "go.temporal.io/server/service/history/queues/errors"
 )
 
 var retryable4xxErrorTypes = []int{
@@ -55,7 +56,7 @@ func outcomeTag(callCtx context.Context, response *http.Response, callErr error)
 
 func (n nexusInvocation) WrapError(result invocationResult, err error) error {
 	if failure, ok := result.(invocationResultRetry); ok {
-		return queues.NewDestinationDownError(failure.err.Error(), err)
+		return queueserrors.NewDestinationDownError(failure.err.Error(), err)
 	}
 	return err
 }
@@ -65,7 +66,7 @@ func (n nexusInvocation) Invoke(ctx context.Context, ns *namespace.Namespace, e 
 		traceLogger := log.With(e.Logger,
 			tag.WorkflowNamespace(ns.Name().String()),
 			tag.Operation("CompleteNexusOperation"),
-			tag.NewStringTag("destination", task.destination),
+			tag.String("destination", task.destination),
 			tag.WorkflowID(n.workflowID),
 			tag.WorkflowRunID(n.runID),
 			tag.AttemptStart(time.Now().UTC()),
@@ -78,7 +79,7 @@ func (n nexusInvocation) Invoke(ctx context.Context, ns *namespace.Namespace, e 
 
 	request, err := nexusrpc.NewCompletionHTTPRequest(ctx, n.nexus.Url, n.completion)
 	if err != nil {
-		return invocationResultFail{queues.NewUnprocessableTaskError(
+		return invocationResultFail{queueserrors.NewUnprocessableTaskError(
 			fmt.Sprintf("failed to construct Nexus request: %v", err),
 		)}
 	}
@@ -89,7 +90,7 @@ func (n nexusInvocation) Invoke(ctx context.Context, ns *namespace.Namespace, e 
 		request.Header.Set(k, v)
 	}
 
-	caller := e.HTTPCallerProvider(queues.NamespaceIDAndDestination{
+	caller := e.HTTPCallerProvider(queuescommon.NamespaceIDAndDestination{
 		NamespaceID: ns.ID().String(),
 		Destination: task.Destination(),
 	})
@@ -123,7 +124,7 @@ func (n nexusInvocation) Invoke(ctx context.Context, ns *namespace.Namespace, e 
 
 	retryable := isRetryableHTTPResponse(response)
 	err = readHandlerErrFromResponse(response, e.Logger)
-	e.Logger.Error("Callback request failed", tag.Error(err), tag.NewStringTag("status", response.Status), tag.NewBoolTag("retryable", retryable))
+	e.Logger.Error("Callback request failed", tag.Error(err), tag.String("status", response.Status), tag.Bool("retryable", retryable))
 	if retryable {
 		return invocationResultRetry{err}
 	}
@@ -142,7 +143,7 @@ func readHandlerErrFromResponse(response *http.Response, logger log.Logger) erro
 
 	body, err := readAndReplaceBody(response)
 	if err != nil {
-		logger.Error("Error reading response body for non-ok callback request", tag.Error(err), tag.NewStringTag("status", response.Status))
+		logger.Error("Error reading response body for non-ok callback request", tag.Error(err), tag.String("status", response.Status))
 		return err
 	}
 

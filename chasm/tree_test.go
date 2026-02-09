@@ -3,6 +3,7 @@ package chasm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"slices"
 	"sort"
@@ -22,10 +23,10 @@ import (
 	"go.temporal.io/server/common/definition"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/persistence/serialization"
+	"go.temporal.io/server/common/primitives"
 	"go.temporal.io/server/common/testing/protoassert"
 	"go.temporal.io/server/common/testing/protorequire"
 	"go.temporal.io/server/common/testing/testlogger"
-	"go.temporal.io/server/common/testing/testvars"
 	"go.temporal.io/server/service/history/tasks"
 	"go.uber.org/mock/gomock"
 	"google.golang.org/protobuf/proto"
@@ -56,8 +57,7 @@ func TestNodeSuite(t *testing.T) {
 func (s *nodeSuite) SetupTest() {
 	s.initAssertions()
 	s.controller = gomock.NewController(s.T())
-	s.nodeBackend = NewMockNodeBackend(s.controller)
-	s.nodeBackend.EXPECT().IsWorkflow().Return(false).AnyTimes()
+	s.nodeBackend = &MockNodeBackend{}
 	s.testLibrary = newTestLibrary(s.controller)
 
 	s.logger = testlogger.NewTestLogger(s.T(), testlogger.FailOnAnyUnexpectedError)
@@ -93,7 +93,7 @@ func (s *nodeSuite) TestNewTree() {
 				InitialVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 1},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_component",
+						TypeId: testComponentTypeID,
 					},
 				},
 			},
@@ -137,9 +137,6 @@ func (s *nodeSuite) TestNewTree() {
 }
 
 func (s *nodeSuite) TestInitSerializedNode_TypeComponent() {
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(1)).Times(1)
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(1)).Times(1)
-
 	node := newNode(s.nodeBase(), nil, "")
 	node.initSerializedNode(fieldTypeComponent)
 
@@ -159,28 +156,24 @@ func (s *nodeSuite) TestSerializeNode_ComponentAttributes() {
 	// Serialize root component.
 	s.NotNil(node.serializedNode.GetMetadata().GetComponentAttributes())
 	s.Nil(node.serializedNode.GetData())
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(2)).Times(1) // for LastUpdatesVersionedTransition for TestComponent
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(2)).Times(1)
 	err := node.serialize()
 	s.NoError(err)
 	s.NotNil(node.serializedNode)
 	s.NotNil(node.serializedNode.GetData(), "node serialized value must have data after serialize is called")
-	s.Equal("TestLibrary.test_component", node.serializedNode.GetMetadata().GetComponentAttributes().GetType(), "node serialized value must have type set")
+	s.Equal(testComponentTypeID, node.serializedNode.GetMetadata().GetComponentAttributes().GetTypeId(), "node serialized value must have type set")
 	s.Equal(valueStateSynced, node.valueState)
 
 	// Serialize subcomponents (there are 2 subcomponents).
 	sc1Node := node.children["SubComponent1"]
 	s.NotNil(sc1Node.serializedNode.GetMetadata().GetComponentAttributes())
 	s.Nil(sc1Node.serializedNode.GetData())
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(2)).Times(2) // for LastUpdatesVersionedTransition of TestSubComponent1
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(2)).Times(2)
 	for _, childNode := range node.children {
 		err = childNode.serialize()
 		s.NoError(err)
 		s.Equal(valueStateSynced, childNode.valueState)
 	}
 	s.NotNil(sc1Node.serializedNode.GetData(), "child node serialized value must have data after serialize is called")
-	s.Equal("TestLibrary.test_sub_component_1", sc1Node.serializedNode.GetMetadata().GetComponentAttributes().GetType(), "node serialized value must have type set")
+	s.Equal(testSubComponent1TypeID, sc1Node.serializedNode.GetMetadata().GetComponentAttributes().GetTypeId(), "node serialized value must have type set")
 
 	// Check SubData too.
 	sd1Node := node.children["SubData1"]
@@ -193,14 +186,12 @@ func (s *nodeSuite) TestSerializeNode_ClearComponentData() {
 
 	node.value.(*TestComponent).ComponentData = nil
 
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(2)).Times(1) // for LastUpdatesVersionedTransition for TestComponent
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(2)).Times(1)
 	err := node.serialize()
 	s.NoError(err)
 	s.NotNil(node.serializedNode, "node serialized value must be not nil after serialize is called")
 	s.NotNil(node.serializedNode.GetMetadata().GetComponentAttributes(), "metadata must have component attributes")
 	s.Nil(node.serializedNode.GetData(), "data field must cleared to nil")
-	s.Equal("TestLibrary.test_component", node.serializedNode.GetMetadata().GetComponentAttributes().GetType(), "type must present")
+	s.Equal(testComponentTypeID, node.serializedNode.GetMetadata().GetComponentAttributes().GetTypeId(), "type must present")
 	s.Equal(valueStateSynced, node.valueState)
 }
 
@@ -226,10 +217,18 @@ func (s *nodeSuite) TestSerializeNode_ClearSubDataField() {
 	s.Nil(sd1Node)
 }
 
-func (s *nodeSuite) TestInitSerializedNode_TypeData() {
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(1)).Times(1) // for InitialVersionedTransition
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(1)).Times(1)
+func (s *nodeSuite) TestSetRootComponent_SetsArchetypeID() {
+	rootNode := NewEmptyTree(s.registry, s.timeSource, s.nodeBackend, s.nodePathEncoder, s.logger)
+	s.Equal(WorkflowArchetypeID, rootNode.ArchetypeID())
+	rootComponent := &TestComponent{
+		MSPointer: NewMSPointer(s.nodeBackend),
+	}
+	rootNode.SetRootComponent(rootComponent)
+	s.Equal(testComponentTypeID, rootNode.ArchetypeID())
+	s.NotEqual(WorkflowArchetypeID, rootNode.ArchetypeID())
+}
 
+func (s *nodeSuite) TestInitSerializedNode_TypeData() {
 	node := newNode(s.nodeBase(), nil, "")
 	node.initSerializedNode(fieldTypeData)
 	s.NotNil(node.serializedNode.GetMetadata().GetDataAttributes(), "node serializedNode must have attributes created")
@@ -241,16 +240,11 @@ func (s *nodeSuite) TestSerializeNode_DataAttributes() {
 		CreateRequestId: "22",
 	}
 
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(1)).Times(1) // for InitialVersionedTransition
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(1)).Times(1)
-
 	node := newNode(s.nodeBase(), nil, "")
 	node.initSerializedNode(fieldTypeData)
 	node.value = component
 	node.valueState = valueStateNeedSerialize
 
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(1)).Times(1)
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(1)).Times(1)
 	err := node.serialize()
 	s.NoError(err)
 	s.NotNil(node.serializedNode.GetData(), "child node serialized value must have data after serialize is called")
@@ -259,21 +253,16 @@ func (s *nodeSuite) TestSerializeNode_DataAttributes() {
 }
 
 func (s *nodeSuite) TestCollectionAttributes() {
-	tv := testvars.New(s.T())
-
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(1)).AnyTimes()
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(1)).AnyTimes()
-	s.nodeBackend.EXPECT().UpdateWorkflowStateStatus(gomock.Any(), gomock.Any()).Return(false, nil).AnyTimes()
-	s.nodeBackend.EXPECT().GetWorkflowKey().Return(tv.Any().WorkflowKey()).AnyTimes()
-
+	runID1 := fmt.Sprintf("workflow_id_%d", 1)
+	runID2 := fmt.Sprintf("workflow_id_%d", 2)
 	sc1 := &TestSubComponent1{
 		SubComponent1Data: &protoMessageType{
-			RunId: tv.WithWorkflowIDNumber(1).WorkflowID(),
+			RunId: runID1,
 		},
 	}
 	sc2 := &TestSubComponent1{
 		SubComponent1Data: &protoMessageType{
-			RunId: tv.WithWorkflowIDNumber(2).WorkflowID(),
+			RunId: runID2,
 		},
 	}
 
@@ -364,12 +353,10 @@ func (s *nodeSuite) TestCollectionAttributes() {
 			}
 
 			chasmContext := NewMutableContext(context.Background(), rootNode)
-			sc1Des, err := sc1Field.Get(chasmContext)
-			s.NoError(err)
+			sc1Des := sc1Field.Get(chasmContext)
 			s.Equal(sc1.SubComponent1Data.GetRunId(), sc1Des.SubComponent1Data.GetRunId())
 
-			sc2Des, err := sc2Field.Get(chasmContext)
-			s.NoError(err)
+			sc2Des := sc2Field.Get(chasmContext)
 			s.Equal(sc2.SubComponent1Data.GetRunId(), sc2Des.SubComponent1Data.GetRunId())
 		})
 
@@ -450,24 +437,17 @@ func (s *nodeSuite) TestCollectionAttributes() {
 }
 
 func (s *nodeSuite) TestPointerAttributes() {
-	tv := testvars.New(s.T())
-
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(1)).AnyTimes()
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(1)).AnyTimes()
-	s.nodeBackend.EXPECT().UpdateWorkflowStateStatus(gomock.Any(), gomock.Any()).Return(false, nil).AnyTimes()
-	s.nodeBackend.EXPECT().GetWorkflowKey().Return(tv.Any().WorkflowKey()).AnyTimes()
-
 	var persistedNodes map[string]*persistencespb.ChasmNode
 
 	sc11 := &TestSubComponent11{
 		SubComponent11Data: &protoMessageType{
-			RunId: tv.WithWorkflowIDNumber(11).WorkflowID(),
+			RunId: fmt.Sprintf("workflow_id_%d", 11),
 		},
 	}
 
 	sc1 := &TestSubComponent1{
 		SubComponent1Data: &protoMessageType{
-			RunId: tv.WithWorkflowIDNumber(1).WorkflowID(),
+			RunId: fmt.Sprintf("workflow_id_%d", 1),
 		},
 		SubComponent11: NewComponentField(nil, sc11),
 	}
@@ -480,7 +460,7 @@ func (s *nodeSuite) TestPointerAttributes() {
 		ctx := NewMutableContext(context.Background(), rootNode)
 
 		rootComponent := &TestComponent{
-			MSPointer:                    s.nodeBackend,
+			MSPointer:                    NewMSPointer(s.nodeBackend),
 			SubComponent1:                NewComponentField(nil, sc1),
 			SubComponentInterfacePointer: NewComponentField[Component](nil, sc1),
 			SubComponent11Pointer:        ComponentPointerTo(ctx, sc11),
@@ -514,13 +494,11 @@ func (s *nodeSuite) TestPointerAttributes() {
 		s.NotNil(testComponent.MSPointer)
 
 		chasmContext := NewMutableContext(context.Background(), rootNode)
-		sc11Des, err := testComponent.SubComponent11Pointer.Get(chasmContext)
-		s.NoError(err)
+		sc11Des := testComponent.SubComponent11Pointer.Get(chasmContext)
 		s.NotNil(sc11Des)
 		s.Equal(sc11.SubComponent11Data.GetRunId(), sc11Des.SubComponent11Data.GetRunId())
 
-		ifacePtr, err := testComponent.SubComponentInterfacePointer.Get(chasmContext)
-		s.NoError(err)
+		ifacePtr := testComponent.SubComponentInterfacePointer.Get(chasmContext)
 		s.NotNil(ifacePtr)
 
 		sc1ptr, ok := ifacePtr.(*TestSubComponent1)
@@ -544,6 +522,66 @@ func (s *nodeSuite) TestPointerAttributes() {
 		s.Len(mutation.UpdatedNodes, 1, "root should be updated")
 		s.Len(mutation.DeletedNodes, 1, "SubComponent11Pointer must be deleted")
 	})
+}
+
+func (s *nodeSuite) TestParentPointer_InMemory() {
+	node := s.testComponentTree()
+
+	s.assertParentPointer(node)
+
+	// Additionally also test parentPtr for components inside a map.
+
+	mutableContext := NewMutableContext(context.Background(), node)
+	component, err := node.Component(mutableContext, ComponentRef{})
+	s.NoError(err)
+	testComponent := component.(*TestComponent)
+
+	mapSubComponent1 := &TestSubComponent1{}
+	// Try using the testComponent we get from the ParentPtr for the mutation.
+	testComponent.SubComponents = Map[string, *TestSubComponent1]{
+		"mapSubComponent1": NewComponentField(mutableContext, mapSubComponent1),
+	}
+
+	s.Panics(func() {
+		_ = mapSubComponent1.ParentPtr.Get(mutableContext)
+	})
+
+	// Sync structure initializes the parent pointer
+	err = node.syncSubComponents()
+	s.NoError(err)
+
+	testComponentFromPtr := mapSubComponent1.ParentPtr.Get(mutableContext)
+	// Asserting they actually point to the same testComponent object.
+	s.Same(testComponent, testComponentFromPtr)
+}
+
+func (s *nodeSuite) TestParentPointer_FromDB() {
+	serializedNodes := testComponentSerializedNodes()
+
+	node, err := s.newTestTree(serializedNodes)
+	s.NoError(err)
+
+	s.assertParentPointer(node)
+}
+
+func (s *nodeSuite) assertParentPointer(testComponentNode *Node) {
+	chasmContext := NewContext(context.Background(), testComponentNode)
+	component, err := testComponentNode.Component(chasmContext, ComponentRef{})
+	s.NoError(err)
+	testComponent := component.(*TestComponent)
+
+	_, found := testComponent.ParentPtr.TryGet(chasmContext)
+	s.False(found)
+
+	subComponent1 := testComponent.SubComponent1.Get(chasmContext)
+	testComponentFromPtr := subComponent1.ParentPtr.Get(chasmContext)
+	// Asserting they actually point to the same testComponent object.
+	s.Same(testComponent, testComponentFromPtr)
+
+	subComponent11 := subComponent1.SubComponent11.Get(chasmContext)
+	testSubComponent1FromPtr := subComponent11.ParentPtr.Get(chasmContext)
+	// Asserting they actually point to the same testSubComponent1 object.
+	s.Same(subComponent1, testSubComponent1FromPtr)
 }
 
 func (s *nodeSuite) TestSyncSubComponents_DeleteLeafNode() {
@@ -592,9 +630,6 @@ func (s *nodeSuite) TestSyncSubComponents_DeleteMiddleNode() {
 
 func (s *nodeSuite) TestDeserializeNode_EmptyPersistence() {
 	var serializedNodes map[string]*persistencespb.ChasmNode
-
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(1)).Times(1) // for InitialVersionedTransition
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(1)).Times(1)
 
 	node, err := s.newTestTree(serializedNodes)
 	s.NoError(err)
@@ -683,8 +718,7 @@ func (s *nodeSuite) TestFieldInterface() {
 	tc := node.value.(*testComponent)
 
 	chasmContext := NewMutableContext(context.Background(), node)
-	sc1, err := tc.SubComponent1.Get(chasmContext)
-	s.NoError(err)
+	sc1 := tc.SubComponent1.Get(chasmContext)
 	s.NotNil(sc1)
 	s.Equal("sub-component1-data", sc1.GetData())
 }
@@ -694,23 +728,17 @@ func (s *nodeSuite) TestGenerateSerializedNodes() {
 
 	node := s.testComponentTree()
 
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(2)).Times(1) // for LastUpdatesVersionedTransition for TestComponent
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(2)).Times(1)
 	err := node.serialize()
 	s.NoError(err)
 	serializedNodes := map[string]*persistencespb.ChasmNode{}
 	serializedNodes[""] = node.serializedNode
 
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(2)).Times(2) // for LastUpdatesVersionedTransition of TestSubComponent1
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(2)).Times(2)
 	for childName, childNode := range node.children {
 		err = childNode.serialize()
 		s.NoError(err)
 		serializedNodes[childName] = childNode.serializedNode
 	}
 
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(2)).Times(2) // for LastUpdatesVersionedTransition of TestSubComponent1
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(2)).Times(2)
 	for childName, childNode := range node.children["SubComponent1"].children {
 		err = childNode.serialize()
 		s.NoError(err)
@@ -728,7 +756,7 @@ func (s *nodeSuite) TestNodeSnapshot() {
 				LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 1},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_component",
+						TypeId: testComponentTypeID,
 					},
 				},
 			},
@@ -793,12 +821,12 @@ func (s *nodeSuite) TestApplyMutation() {
 				LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 1},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_component",
+						TypeId: testComponentTypeID,
 						PureTasks: []*persistencespb.ChasmComponentAttributes_Task{
 							{
 								// This task is not updated, so it's deserialized version will
 								// NOT be cleared below as part of the updateNode process.
-								Type:                      "TestLibrary.test_pure_task",
+								TypeId:                    testPureTaskTypeID,
 								ScheduledTime:             timestamppb.New(now.Add(time.Second)),
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
 								VersionedTransitionOffset: 1,
@@ -809,7 +837,7 @@ func (s *nodeSuite) TestApplyMutation() {
 							},
 							{
 								// Task will be deleted, so deserialized version of this task should also be deleted from cache.
-								Type:                      "TestLibrary.test_pure_task",
+								TypeId:                    testPureTaskTypeID,
 								ScheduledTime:             timestamppb.New(now.Add(time.Second)),
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
 								VersionedTransitionOffset: 2,
@@ -835,11 +863,11 @@ func (s *nodeSuite) TestApplyMutation() {
 				LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 3},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_sub_component_11",
+						TypeId: testSubComponent11TypeID,
 						PureTasks: []*persistencespb.ChasmComponentAttributes_Task{
 							{
 								// Node is deleted, so deserialized version of this task should be deleted from cache.
-								Type:                      "TestLibrary.test_pure_task",
+								TypeId:                    testPureTaskTypeID,
 								ScheduledTime:             timestamppb.New(now.Add(time.Minute)),
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
 								VersionedTransitionOffset: 3,
@@ -862,8 +890,11 @@ func (s *nodeSuite) TestApplyMutation() {
 	}
 	root, err := s.newTestTree(persistenceNodes)
 	s.NoError(err)
-	s.Len(root.currentSA, 1)
-	s.Len(root.currentMemo, 1)
+	s.Len(root.currentSA, 3)
+	s.NotNil(root.currentMemo)
+	initialMemo, ok := root.currentMemo.(*protoMessageType)
+	s.True(ok)
+	s.ProtoEqual(&protoMessageType{}, initialMemo)
 
 	// Manually deserialize some tasks to populate the taskValueCache
 	_, err = root.deserializeComponentTask(root.serializedNode.Metadata.GetComponentAttributes().PureTasks[0])
@@ -885,10 +916,10 @@ func (s *nodeSuite) TestApplyMutation() {
 			LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 30},
 			Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 				ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-					Type: "TestLibrary.test_component",
+					TypeId: testComponentTypeID,
 					PureTasks: []*persistencespb.ChasmComponentAttributes_Task{
 						{
-							Type:                      "TestLibrary.test_pure_task",
+							TypeId:                    testPureTaskTypeID,
 							ScheduledTime:             timestamppb.New(now.Add(time.Second)),
 							VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
 							VersionedTransitionOffset: 1,
@@ -935,10 +966,16 @@ func (s *nodeSuite) TestApplyMutation() {
 	// Validate root node got updated.
 	s.Equal(updatedRoot, root.serializedNode)
 	s.NotNil(root.value)
-	s.Len(root.currentSA, 1)
-	s.Len(root.currentMemo, 1)
-	s.True(root.currentSA[testComponentStartTimeSAKey].(VisibilityValueTime).Equal(VisibilityValueTime(now)))
-	s.True(root.currentMemo[testComponentStartTimeMemoKey].(VisibilityValueTime).Equal(VisibilityValueTime(now)))
+	s.Len(root.currentSA, 3)
+	s.Len(root.currentSA, 3)
+	s.Contains(root.currentSA, "TemporalDatetime01")
+	s.True(root.currentSA["TemporalDatetime01"].(VisibilityValueTime).Equal(VisibilityValueTime(now)))
+
+	// Validate memo content.
+	s.NotNil(root.currentMemo)
+	decodedMemo, ok := root.currentMemo.(*protoMessageType)
+	s.True(ok, "currentMemo should be of type *protoMessageType")
+	s.True(decodedMemo.StartTime.AsTime().Equal(now))
 
 	// Validate the "child" node got updated.
 	nodeSC1, ok := root.children["SubComponent1"]
@@ -980,7 +1017,7 @@ func (s *nodeSuite) TestApplySnapshot() {
 				LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 1},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_component",
+						TypeId: testComponentTypeID,
 					},
 				},
 			},
@@ -1028,7 +1065,7 @@ func (s *nodeSuite) TestApplySnapshot() {
 					LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 10},
 					Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 						ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-							Type: "TestLibrary.test_component",
+							TypeId: testComponentTypeID,
 						},
 					},
 				},
@@ -1069,16 +1106,12 @@ func (s *nodeSuite) TestApplySnapshot() {
 	s.Equal(expectedMutation, root.mutation)
 
 	// Validate visibility search attributes and memo are updated as well.
-	s.Len(root.currentSA, 1)
-	s.Len(root.currentMemo, 1)
-	s.True(root.currentSA[testComponentStartTimeSAKey].(VisibilityValueTime).Equal(VisibilityValueTime(now.AsTime())))
-	s.True(root.currentMemo[testComponentStartTimeMemoKey].(VisibilityValueTime).Equal(VisibilityValueTime(now.AsTime())))
+	s.Len(root.currentSA, 3)
+	s.Contains(root.currentSA, "TemporalDatetime01")
+	s.True(root.currentSA["TemporalDatetime01"].(VisibilityValueTime).Equal(VisibilityValueTime(now.AsTime())))
 }
 
 func (s *nodeSuite) TestApplyMutation_OutOfOrder() {
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(1)).AnyTimes()
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(0)).AnyTimes()
-
 	persistenceNodes := map[string]*persistencespb.ChasmNode{
 		"": {
 			Metadata: &persistencespb.ChasmNodeMetadata{
@@ -1086,7 +1119,7 @@ func (s *nodeSuite) TestApplyMutation_OutOfOrder() {
 				LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 1},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_component",
+						TypeId: testComponentTypeID,
 					},
 				},
 			},
@@ -1097,8 +1130,8 @@ func (s *nodeSuite) TestApplyMutation_OutOfOrder() {
 	s.NoError(err)
 
 	// Test the case where child node is applied before parent node.
-	err = root.ApplySnapshot(NodesSnapshot{
-		Nodes: map[string]*persistencespb.ChasmNode{
+	err = root.ApplyMutation(NodesMutation{
+		UpdatedNodes: map[string]*persistencespb.ChasmNode{
 			"SubComponent1/SubComponent11": {
 				Metadata: &persistencespb.ChasmNodeMetadata{
 					InitialVersionedTransition:    &persistencespb.VersionedTransition{TransitionCount: 2},
@@ -1117,7 +1150,7 @@ func (s *nodeSuite) TestApplyMutation_OutOfOrder() {
 					LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 2},
 					Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 						ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-							Type: "TestLibrary.test_component",
+							TypeId: testComponentTypeID,
 						},
 					},
 				},
@@ -1139,6 +1172,7 @@ func (s *nodeSuite) TestApplyMutation_OutOfOrder() {
 
 func (s *nodeSuite) TestRefreshTasks() {
 	now := s.timeSource.Now()
+	pureTaskScheduledTime := now.Add(time.Second).UTC()
 	persistenceNodes := map[string]*persistencespb.ChasmNode{
 		"": {
 			Metadata: &persistencespb.ChasmNodeMetadata{
@@ -1146,10 +1180,10 @@ func (s *nodeSuite) TestRefreshTasks() {
 				LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 1},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_component",
+						TypeId: testComponentTypeID,
 						PureTasks: []*persistencespb.ChasmComponentAttributes_Task{
 							{
-								Type:                      "TestLibrary.test_pure_task",
+								TypeId:                    testPureTaskTypeID,
 								ScheduledTime:             timestamppb.New(now.Add(time.Minute)),
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
 								VersionedTransitionOffset: 1,
@@ -1166,11 +1200,11 @@ func (s *nodeSuite) TestRefreshTasks() {
 				LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 1},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_sub_component_1",
+						TypeId: testSubComponent1TypeID,
 						PureTasks: []*persistencespb.ChasmComponentAttributes_Task{
 							{
-								Type:                      "TestLibrary.test_pure_task",
-								ScheduledTime:             timestamppb.New(now.Add(time.Second)),
+								TypeId:                    testPureTaskTypeID,
+								ScheduledTime:             timestamppb.New(pureTaskScheduledTime),
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
 								VersionedTransitionOffset: 2,
 								PhysicalTaskStatus:        physicalTaskStatusCreated,
@@ -1186,10 +1220,10 @@ func (s *nodeSuite) TestRefreshTasks() {
 				LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 1},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_sub_component_2",
+						TypeId: testSubComponent2TypeID,
 						SideEffectTasks: []*persistencespb.ChasmComponentAttributes_Task{
 							{
-								Type:                      "TestLibrary.test_side_effect_task",
+								TypeId:                    testSideEffectTaskTypeID,
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
 								VersionedTransitionOffset: 3,
 								PhysicalTaskStatus:        physicalTaskStatusCreated,
@@ -1210,23 +1244,11 @@ func (s *nodeSuite) TestRefreshTasks() {
 	s.True(root.IsDirty())
 	s.False(root.IsStateDirty())
 
-	s.nodeBackend.EXPECT().GetWorkflowKey().Return(definition.WorkflowKey{
-		NamespaceID: "ns-id",
-		WorkflowID:  "wf-id",
-		RunID:       "run-id",
-	}).AnyTimes()
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(0)).AnyTimes()
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(2)).AnyTimes()
-
-	addedTasks := 0
-	s.nodeBackend.EXPECT().AddTasks(gomock.Any()).Do(func(addedTask tasks.Task) {
-		addedTasks++
-	}).AnyTimes()
-
 	mutation, err := root.CloseTransaction()
 	s.NoError(err)
 	s.Len(mutation.UpdatedNodes, 2) // TaskStatus for the root node is not reset, so no need to persist it.
-	s.Equal(2, addedTasks)
+	s.Equal(2, s.nodeBackend.NumTasksAdded())
+	s.Equal(pureTaskScheduledTime, s.nodeBackend.LastDeletePureTaskCall())
 }
 
 func (s *nodeSuite) TestCarryOverTaskStatus() {
@@ -1238,22 +1260,22 @@ func (s *nodeSuite) TestCarryOverTaskStatus() {
 				LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 2},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_component",
+						TypeId: testComponentTypeID,
 						SideEffectTasks: []*persistencespb.ChasmComponentAttributes_Task{
 							{
-								Type:                      "TestLibrary.test_side_effect_task",
+								TypeId:                    testSideEffectTaskTypeID,
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
 								VersionedTransitionOffset: 1,
 								PhysicalTaskStatus:        physicalTaskStatusCreated,
 							},
 							{
-								Type:                      "TestLibrary.test_side_effect_task",
+								TypeId:                    testSideEffectTaskTypeID,
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
 								VersionedTransitionOffset: 2,
 								PhysicalTaskStatus:        physicalTaskStatusCreated,
 							},
 							{
-								Type:                      "TestLibrary.test_side_effect_task",
+								TypeId:                    testSideEffectTaskTypeID,
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 2},
 								VersionedTransitionOffset: 1,
 								PhysicalTaskStatus:        physicalTaskStatusCreated,
@@ -1261,21 +1283,21 @@ func (s *nodeSuite) TestCarryOverTaskStatus() {
 						},
 						PureTasks: []*persistencespb.ChasmComponentAttributes_Task{
 							{
-								Type:                      "TestLibrary.test_pure_task",
+								TypeId:                    testPureTaskTypeID,
 								ScheduledTime:             timestamppb.New(now.Add(time.Minute)),
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 2},
 								VersionedTransitionOffset: 2,
 								PhysicalTaskStatus:        physicalTaskStatusCreated,
 							},
 							{
-								Type:                      "TestLibrary.test_pure_task",
+								TypeId:                    testPureTaskTypeID,
 								ScheduledTime:             timestamppb.New(now.Add(2 * time.Minute)),
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
 								VersionedTransitionOffset: 3,
 								PhysicalTaskStatus:        physicalTaskStatusCreated,
 							},
 							{
-								Type:                      "TestLibrary.test_pure_task",
+								TypeId:                    testPureTaskTypeID,
 								ScheduledTime:             timestamppb.New(now.Add(3 * time.Minute)),
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 2},
 								VersionedTransitionOffset: 3,
@@ -1307,16 +1329,16 @@ func (s *nodeSuite) TestCarryOverTaskStatus() {
 					LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 3},
 					Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 						ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-							Type: "TestLibrary.test_component",
+							TypeId: testComponentTypeID,
 							SideEffectTasks: []*persistencespb.ChasmComponentAttributes_Task{
 								{
-									Type:                      "TestLibrary.test_side_effect_task",
+									TypeId:                    testSideEffectTaskTypeID,
 									VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
 									VersionedTransitionOffset: 2,
 									PhysicalTaskStatus:        physicalTaskStatusCreated,
 								},
 								{
-									Type:                      "TestLibrary.test_side_effect_task",
+									TypeId:                    testSideEffectTaskTypeID,
 									VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 3},
 									VersionedTransitionOffset: 1,
 									PhysicalTaskStatus:        physicalTaskStatusCreated,
@@ -1324,21 +1346,21 @@ func (s *nodeSuite) TestCarryOverTaskStatus() {
 							},
 							PureTasks: []*persistencespb.ChasmComponentAttributes_Task{
 								{
-									Type:                      "TestLibrary.test_pure_task",
+									TypeId:                    testPureTaskTypeID,
 									ScheduledTime:             timestamppb.New(now.Add(time.Second)),
 									VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 3},
 									VersionedTransitionOffset: 2,
 									PhysicalTaskStatus:        physicalTaskStatusCreated,
 								},
 								{
-									Type:                      "TestLibrary.test_pure_task",
+									TypeId:                    testPureTaskTypeID,
 									ScheduledTime:             timestamppb.New(now.Add(2 * time.Minute)),
 									VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
 									VersionedTransitionOffset: 3,
 									PhysicalTaskStatus:        physicalTaskStatusCreated,
 								},
 								{
-									Type:                      "TestLibrary.test_pure_task",
+									TypeId:                    testPureTaskTypeID,
 									ScheduledTime:             timestamppb.New(now.Add(3 * time.Minute)),
 									VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 2},
 									VersionedTransitionOffset: 3,
@@ -1368,16 +1390,16 @@ func (s *nodeSuite) TestCarryOverTaskStatus() {
 				LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 3},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_component",
+						TypeId: testComponentTypeID,
 						SideEffectTasks: []*persistencespb.ChasmComponentAttributes_Task{
 							{
-								Type:                      "TestLibrary.test_side_effect_task",
+								TypeId:                    testSideEffectTaskTypeID,
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
 								VersionedTransitionOffset: 2,
 								PhysicalTaskStatus:        physicalTaskStatusCreated,
 							},
 							{
-								Type:                      "TestLibrary.test_side_effect_task",
+								TypeId:                    testSideEffectTaskTypeID,
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 3},
 								VersionedTransitionOffset: 1,
 								PhysicalTaskStatus:        physicalTaskStatusNone,
@@ -1385,21 +1407,21 @@ func (s *nodeSuite) TestCarryOverTaskStatus() {
 						},
 						PureTasks: []*persistencespb.ChasmComponentAttributes_Task{
 							{
-								Type:                      "TestLibrary.test_pure_task",
+								TypeId:                    testPureTaskTypeID,
 								ScheduledTime:             timestamppb.New(now.Add(time.Second)),
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 3},
 								VersionedTransitionOffset: 2,
 								PhysicalTaskStatus:        physicalTaskStatusNone,
 							},
 							{
-								Type:                      "TestLibrary.test_pure_task",
+								TypeId:                    testPureTaskTypeID,
 								ScheduledTime:             timestamppb.New(now.Add(2 * time.Minute)),
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
 								VersionedTransitionOffset: 3,
 								PhysicalTaskStatus:        physicalTaskStatusCreated,
 							},
 							{
-								Type:                      "TestLibrary.test_pure_task",
+								TypeId:                    testPureTaskTypeID,
 								ScheduledTime:             timestamppb.New(now.Add(3 * time.Minute)),
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 2},
 								VersionedTransitionOffset: 3,
@@ -1442,14 +1464,29 @@ func (s *nodeSuite) TestValidateAccess() {
 		setup func(*Node, Context) error
 	}{
 		{
-			name:            "access check applies only to ancestors",
+			name:            "access check applies only to ancestors (terminated)",
 			valid:           true,
 			intent:          OperationIntentProgress,
 			lifecycleStatus: enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
 			terminated:      false,
-			setup: func(target *Node, _ Context) error {
+			setup: func(target *Node, ctx Context) error {
 				// Set the terminated flag on the target node instead of an ancestor
 				target.terminated = true
+				return nil
+			},
+		},
+		{
+			name:            "access check applies only to ancestors (closed)",
+			valid:           true,
+			intent:          OperationIntentProgress,
+			lifecycleStatus: enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+			terminated:      false,
+			setup: func(target *Node, ctx Context) error {
+				if err := target.prepareComponentValue(ctx); err != nil {
+					return err
+				}
+				targetComponent, _ := target.value.(*TestSubComponent11)
+				targetComponent.SubComponent11Data.Status = enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED
 				return nil
 			},
 		},
@@ -1480,6 +1517,20 @@ func (s *nodeSuite) TestValidateAccess() {
 			lifecycleStatus: enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
 			terminated:      true,
 			valid:           false,
+		},
+		{
+			name:            "detached node skips parent validation",
+			valid:           true,
+			intent:          OperationIntentProgress,
+			lifecycleStatus: enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED, // root is closed
+			terminated:      false,
+			setup: func(target *Node, _ Context) error {
+				// Set the parent node (SubComponent1) as detached.
+				// When validateParentAccess is called on a detached node, it skips
+				// ancestor validation entirely.
+				target.parent.serializedNode.GetMetadata().GetComponentAttributes().Detached = true
+				return nil
+			},
 		},
 	}
 
@@ -1512,10 +1563,8 @@ func (s *nodeSuite) TestValidateAccess() {
 				s.NoError(tc.setup(node, ctx))
 			}
 
-			// Validation always begins on the target node's parent.
-			parent := node.parent
-			s.NotNil(parent)
-			err = parent.validateAccess(ctx)
+			// Validation begins on the target node, checking ancestors only.
+			err = node.validateAccess(ctx)
 			if tc.valid {
 				s.NoError(err)
 			} else {
@@ -1527,11 +1576,73 @@ func (s *nodeSuite) TestValidateAccess() {
 
 }
 
-func (s *nodeSuite) TestGetComponent() {
+func (s *nodeSuite) TestGetComponent_DetachedNodeBypassesParentValidation() {
+	// Test that a detached node can be accessed even when its parent is closed.
 	root, err := s.newTestTree(testComponentSerializedNodes())
 	s.NoError(err)
 
+	targetPath := []string{"SubComponent1", "SubComponent11"}
+	targetNode, ok := root.findNode(targetPath)
+	s.True(ok)
+
+	// Mark the target node as detached.
+	targetNode.serializedNode.GetMetadata().GetComponentAttributes().Detached = true
+
+	// Close the root node (set lifecycle to COMPLETED).
+	ctx := NewMutableContext(
+		newContextWithOperationIntent(context.Background(), OperationIntentProgress),
+		root,
+	)
+	err = root.prepareComponentValue(ctx)
+	s.NoError(err)
+	rootComponent, ok := root.value.(*TestComponent)
+	s.True(ok)
+	rootComponent.ComponentData.Status = enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED
+
+	// GetComponent on the detached node should succeed despite root being closed.
+	ref := ComponentRef{
+		componentPath: targetPath,
+	}
+	component, err := root.Component(ctx, ref)
+	s.NoError(err)
+	s.NotNil(component)
+}
+
+func (s *nodeSuite) TestGetComponent_ClosedTargetSucceeds() {
+	// Test that a closed target component can still be accessed via Component()
+	// because we only check ancestor lifecycle, not the target's lifecycle.
+	root, err := s.newTestTree(testComponentSerializedNodes())
+	s.NoError(err)
+
+	targetPath := []string{"SubComponent1", "SubComponent11"}
+	targetNode, ok := root.findNode(targetPath)
+	s.True(ok)
+
+	ctx := NewMutableContext(
+		newContextWithOperationIntent(context.Background(), OperationIntentProgress),
+		root,
+	)
+
+	// Close the target node's lifecycle (set to COMPLETED).
+	err = targetNode.prepareComponentValue(ctx)
+	s.NoError(err)
+	targetComponent, ok := targetNode.value.(*TestSubComponent11)
+	s.True(ok)
+	targetComponent.SubComponent11Data.Status = enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED
+	s.True(targetComponent.LifecycleState(ctx).IsClosed())
+
+	// GetComponent on the closed target should succeed because we only check ancestors.
+	ref := ComponentRef{
+		componentPath: targetPath,
+	}
+	component, err := root.Component(ctx, ref)
+	s.NoError(err)
+	s.NotNil(component)
+}
+
+func (s *nodeSuite) TestGetComponent() {
 	errValidation := errors.New("some random validation error")
+
 	expectedTestComponent := &TestComponent{}
 	setTestComponentFields(expectedTestComponent, s.nodeBackend)
 	assertTestComponent := func(component Component) {
@@ -1545,39 +1656,27 @@ func (s *nodeSuite) TestGetComponent() {
 
 	testCases := []struct {
 		name            string
-		chasmContext    Context
+		chasmContextFn  func(root *Node) Context
 		ref             ComponentRef
 		expectedErr     error
-		valueState      valueState
+		nodeDirty       bool
 		assertComponent func(Component)
 	}{
 		{
-			name:         "path not found",
-			chasmContext: NewContext(context.Background(), root),
+			name: "path not found",
+			chasmContextFn: func(root *Node) Context {
+				return NewContext(context.Background(), root)
+			},
 			ref: ComponentRef{
 				componentPath: []string{"unknownComponent"},
 			},
 			expectedErr: errComponentNotFound,
 		},
 		{
-			name:         "archetype mismatch",
-			chasmContext: NewContext(context.Background(), root),
-			ref: ComponentRef{
-				archetype: "TestLibrary.test_sub_component_1",
+			name: "initialVT mismatch",
+			chasmContextFn: func(root *Node) Context {
+				return NewMutableContext(context.Background(), root)
 			},
-			expectedErr: errComponentNotFound,
-		},
-		{
-			name:         "entityGoType mismatch",
-			chasmContext: NewContext(context.Background(), root),
-			ref: ComponentRef{
-				entityGoType: reflect.TypeFor[*TestSubComponent2](),
-			},
-			expectedErr: errComponentNotFound,
-		},
-		{
-			name:         "initialVT mismatch",
-			chasmContext: NewContext(context.Background(), root),
 			ref: ComponentRef{
 				componentPath: []string{"SubComponent1", "SubComponent11"},
 				// should be (1, 1) but we set it to (2, 2)
@@ -1589,8 +1688,10 @@ func (s *nodeSuite) TestGetComponent() {
 			expectedErr: errComponentNotFound,
 		},
 		{
-			name:         "validation failure",
-			chasmContext: NewContext(context.Background(), root),
+			name: "validation failure",
+			chasmContextFn: func(root *Node) Context {
+				return NewMutableContext(context.Background(), root)
+			},
 			ref: ComponentRef{
 				componentPath: []string{"SubComponent1"},
 				componentInitialVT: &persistencespb.VersionedTransition{
@@ -1604,8 +1705,10 @@ func (s *nodeSuite) TestGetComponent() {
 			expectedErr: errValidation,
 		},
 		{
-			name:         "success readonly access",
-			chasmContext: NewContext(context.Background(), root),
+			name: "success readonly access",
+			chasmContextFn: func(root *Node) Context {
+				return NewContext(context.Background(), root)
+			},
 			ref: ComponentRef{
 				componentPath: []string{}, // root
 				componentInitialVT: &persistencespb.VersionedTransition{
@@ -1617,70 +1720,86 @@ func (s *nodeSuite) TestGetComponent() {
 				},
 			},
 			expectedErr:     nil,
-			valueState:      valueStateSynced,
 			assertComponent: assertTestComponent,
 		},
 		{
-			name:         "success mutable access",
-			chasmContext: NewMutableContext(context.Background(), root),
+			name: "success mutable access",
+			chasmContextFn: func(root *Node) Context {
+				return NewMutableContext(context.Background(), root)
+			},
 			ref: ComponentRef{
 				componentPath: []string{}, // root
 			},
 			expectedErr:     nil,
-			valueState:      valueStateNeedSyncStructure,
+			nodeDirty:       true,
 			assertComponent: assertTestComponent,
 		},
 	}
 
 	for _, tc := range testCases {
 		s.Run(tc.name, func() {
-			component, err := root.Component(tc.chasmContext, tc.ref)
-			s.Equal(tc.expectedErr, err)
-			if tc.expectedErr == nil {
-				// s.Equal(tc.expectedComponent, component)
+			root, err := s.newTestTree(testComponentSerializedNodes())
+			s.NoError(err)
 
-				node, ok := root.findNode(tc.ref.componentPath)
+			component, err := root.Component(tc.chasmContextFn(root), tc.ref)
+			s.Equal(tc.expectedErr, err)
+
+			node, ok := root.findNode(tc.ref.componentPath)
+			if tc.expectedErr == nil {
 				s.True(ok)
-				s.Equal(component, node.value)
-				s.Equal(tc.valueState, node.valueState)
+				tc.assertComponent(component)
+			}
+
+			if ok {
+				if tc.nodeDirty {
+					s.Greater(node.valueState, valueStateSynced)
+				} else {
+					s.LessOrEqual(node.valueState, valueStateSynced)
+				}
 			}
 		})
 	}
 }
 
 func (s *nodeSuite) TestRef() {
-	root, err := s.newTestTree(testComponentSerializedNodes())
-	s.NoError(err)
-
-	tv := testvars.New(s.T())
-	workflowKey := tv.Any().WorkflowKey()
-	entityKey := EntityKey{
+	workflowKey := definition.NewWorkflowKey(
+		primitives.NewUUID().String(),
+		primitives.NewUUID().String(),
+		primitives.NewUUID().String(),
+	)
+	executionKey := ExecutionKey{
 		NamespaceID: workflowKey.NamespaceID,
 		BusinessID:  workflowKey.WorkflowID,
-		EntityID:    workflowKey.RunID,
+		RunID:       workflowKey.RunID,
 	}
 	currentVT := &persistencespb.VersionedTransition{
 		NamespaceFailoverVersion: 2,
 		TransitionCount:          2,
 	}
+	s.nodeBackend = &MockNodeBackend{
+		HandleCurrentVersionedTransition: func() *persistencespb.VersionedTransition {
+			return currentVT
+		},
+		HandleGetWorkflowKey: func() definition.WorkflowKey {
+			return workflowKey
+		},
+	}
 
-	s.nodeBackend.EXPECT().CurrentVersionedTransition().Return(currentVT).AnyTimes()
-	s.nodeBackend.EXPECT().GetWorkflowKey().Return(workflowKey).AnyTimes()
+	root, err := s.newTestTree(testComponentSerializedNodes())
+	s.NoError(err)
 
 	chasmContext := NewContext(context.Background(), root)
-	rootComponent, err := root.Component(chasmContext, NewComponentRef[*TestComponent](entityKey))
+	rootComponent, err := root.Component(chasmContext, NewComponentRef[*TestComponent](executionKey))
 	s.NoError(err)
 	testComponent, ok := rootComponent.(*TestComponent)
 	s.True(ok)
 
 	rc, ok := s.registry.ComponentFor(testComponent)
 	s.True(ok)
-	archetype := Archetype(rc.FqType())
+	archetypeID := rc.componentID
 
-	subComponent1, err := testComponent.SubComponent1.Get(chasmContext)
-	s.NoError(err)
-	subComponent11, err := subComponent1.SubComponent11.Get(chasmContext)
-	s.NoError(err)
+	subComponent1 := testComponent.SubComponent1.Get(chasmContext)
+	subComponent11 := subComponent1.SubComponent11.Get(chasmContext)
 
 	testCases := []struct {
 		name             string
@@ -1737,21 +1856,21 @@ func (s *nodeSuite) TestRef() {
 
 			s.NoError(err)
 			expectedRef := ComponentRef{
-				EntityKey:     entityKey,
-				archetype:     archetype,
+				ExecutionKey:  executionKey,
+				archetypeID:   archetypeID,
 				componentPath: tc.expectedPath,
 
 				// Proto fields are validated separately with ProtoEqual.
-				// entityLastUpdateVT: currentVT,
+				// executionLastUpdateVT: currentVT,
 				// componentInitialVT: tc.expectedInitalVT,
 			}
 
 			actualRef, err := DeserializeComponentRef(encodedRef)
 			s.NoError(err)
-			s.ProtoEqual(currentVT, actualRef.entityLastUpdateVT)
+			s.ProtoEqual(currentVT, actualRef.executionLastUpdateVT)
 			s.ProtoEqual(tc.expectedInitalVT, actualRef.componentInitialVT)
 
-			actualRef.entityLastUpdateVT = nil
+			actualRef.executionLastUpdateVT = nil
 			actualRef.componentInitialVT = nil
 			s.Equal(expectedRef, actualRef)
 		})
@@ -1824,18 +1943,11 @@ func (s *nodeSuite) TestSerializeDeserializeTask() {
 
 func (s *nodeSuite) TestCloseTransaction_Success() {
 	node := s.testComponentTree()
-	tv := testvars.New(s.T())
-
 	chasmCtx := NewMutableContext(context.Background(), node)
 	tc, err := node.Component(chasmCtx, ComponentRef{componentPath: rootPath})
 	s.NoError(err)
 	tc.(*TestComponent).SubData1 = NewEmptyField[*protoMessageType]()
-	tc.(*TestComponent).ComponentData = &protoMessageType{CreateRequestId: tv.Any().String()}
-
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(1)).AnyTimes()
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(1)).AnyTimes()
-	s.nodeBackend.EXPECT().GetWorkflowKey().Return(tv.Any().WorkflowKey()).AnyTimes()
-	s.nodeBackend.EXPECT().UpdateWorkflowStateStatus(gomock.Any(), gomock.Any()).Return(false, nil).AnyTimes()
+	tc.(*TestComponent).ComponentData = &protoMessageType{CreateRequestId: primitives.NewUUID().String()}
 
 	mutations, err := node.CloseTransaction()
 	s.NoError(err)
@@ -1847,8 +1959,7 @@ func (s *nodeSuite) TestCloseTransaction_Success() {
 	s.Len(mutations.DeletedNodes, 1)
 	s.Contains(mutations.DeletedNodes, "SubData1", "SubData1 was removed and must be in DeletedNodes")
 
-	sc1, err := tc.(*TestComponent).SubComponent1.Get(chasmCtx)
-	s.NoError(err)
+	sc1 := tc.(*TestComponent).SubComponent1.Get(chasmCtx)
 	s.NotNil(sc1)
 
 	mutations, err = node.CloseTransaction()
@@ -1859,17 +1970,11 @@ func (s *nodeSuite) TestCloseTransaction_Success() {
 }
 
 func (s *nodeSuite) TestCloseTransaction_EmptyNode() {
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(1)).Times(1) // for InitialVersionedTransition of the root component.
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(1)).Times(1)
-
 	var nilSerializedNodes map[string]*persistencespb.ChasmNode
 	// Create an empty tree.
 	node, err := s.newTestTree(nilSerializedNodes)
 	s.NoError(err)
 	s.Nil(node.value)
-
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(1)).Times(1)
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(1)).Times(1)
 
 	mutations, err := node.CloseTransaction()
 	s.NoError(err)
@@ -1879,100 +1984,82 @@ func (s *nodeSuite) TestCloseTransaction_EmptyNode() {
 
 func (s *nodeSuite) TestCloseTransaction_LifecycleChange() {
 	node := s.testComponentTree()
-	tv := testvars.New(s.T())
 
 	chasmCtx := NewMutableContext(context.Background(), node)
 	_, err := node.Component(chasmCtx, ComponentRef{componentPath: rootPath})
 	s.NoError(err)
-
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(1)).AnyTimes()
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(1)).AnyTimes()
-	s.nodeBackend.EXPECT().GetWorkflowKey().Return(tv.Any().WorkflowKey()).AnyTimes()
-
-	s.nodeBackend.EXPECT().UpdateWorkflowStateStatus(
-		enumsspb.WORKFLOW_EXECUTION_STATE_RUNNING,
-		enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
-	).Return(true, nil).Times(1)
 	_, err = node.CloseTransaction()
 	s.NoError(err)
+	s.Equal(enumsspb.WORKFLOW_EXECUTION_STATE_RUNNING, s.nodeBackend.LastUpdateWorkflowState())
+	s.Equal(enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING, s.nodeBackend.LastUpdateWorkflowStatus())
 
 	// Test force terminate case
 	_, err = node.Component(chasmCtx, ComponentRef{componentPath: rootPath})
 	s.NoError(err)
 	node.terminated = true
-	s.nodeBackend.EXPECT().UpdateWorkflowStateStatus(
-		enumsspb.WORKFLOW_EXECUTION_STATE_COMPLETED,
-		enumspb.WORKFLOW_EXECUTION_STATUS_TERMINATED,
-	).Return(true, nil).Times(1)
 	_, err = node.CloseTransaction()
 	s.NoError(err)
-	node.terminated = false
+	s.Equal(enumsspb.WORKFLOW_EXECUTION_STATE_COMPLETED, s.nodeBackend.LastUpdateWorkflowState())
+	s.Equal(enumspb.WORKFLOW_EXECUTION_STATUS_TERMINATED, s.nodeBackend.LastUpdateWorkflowStatus())
 
+	node.terminated = false
 	tc, err := node.Component(chasmCtx, ComponentRef{componentPath: rootPath})
 	s.NoError(err)
 	tc.(*TestComponent).Complete(chasmCtx)
-	s.nodeBackend.EXPECT().UpdateWorkflowStateStatus(
-		enumsspb.WORKFLOW_EXECUTION_STATE_COMPLETED,
-		enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
-	).Return(true, nil).Times(1)
 	_, err = node.CloseTransaction()
 	s.NoError(err)
+	s.Equal(enumsspb.WORKFLOW_EXECUTION_STATE_COMPLETED, s.nodeBackend.LastUpdateWorkflowState())
+	s.Equal(enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED, s.nodeBackend.LastUpdateWorkflowStatus())
 
 	tc, err = node.Component(chasmCtx, ComponentRef{componentPath: rootPath})
 	s.NoError(err)
 	tc.(*TestComponent).Fail(chasmCtx)
-	s.nodeBackend.EXPECT().UpdateWorkflowStateStatus(
-		enumsspb.WORKFLOW_EXECUTION_STATE_COMPLETED,
-		enumspb.WORKFLOW_EXECUTION_STATUS_FAILED,
-	).Return(true, nil).Times(1)
 	_, err = node.CloseTransaction()
 	s.NoError(err)
+	s.Equal(enumsspb.WORKFLOW_EXECUTION_STATE_COMPLETED, s.nodeBackend.LastUpdateWorkflowState())
+	s.Equal(enumspb.WORKFLOW_EXECUTION_STATUS_FAILED, s.nodeBackend.LastUpdateWorkflowStatus())
 }
 
 func (s *nodeSuite) TestCloseTransaction_ForceUpdateVisibility_RootLifecycleChanged() {
 	node := s.testComponentTree()
-	tv := testvars.New(s.T())
 
 	chasmCtx := NewMutableContext(context.Background(), node)
 	testComponent, err := node.Component(chasmCtx, ComponentRef{componentPath: rootPath})
 	s.NoError(err)
 
 	nextTransitionCount := int64(1)
-	s.nodeBackend.EXPECT().NextTransitionCount().DoAndReturn(func() int64 {
-		return nextTransitionCount
-	}).AnyTimes()
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(1)).AnyTimes()
-	s.nodeBackend.EXPECT().GetWorkflowKey().Return(tv.Any().WorkflowKey()).AnyTimes()
-	s.nodeBackend.EXPECT().AddTasks(gomock.Any()).AnyTimes()
+	s.nodeBackend.HandleGetCurrentVersion = func() int64 { return 1 }
+	s.nodeBackend.HandleNextTransitionCount = func() int64 { return nextTransitionCount }
+	s.nodeBackend.HandleUpdateWorkflowStateStatus = func(state enumsspb.WorkflowExecutionState, status enumspb.WorkflowExecutionStatus) (bool, error) {
+		return true, nil
+	}
 
 	// Init visiblity component
 	testComponent.(*TestComponent).Visibility = NewComponentField(chasmCtx, NewVisibility(chasmCtx))
-	s.nodeBackend.EXPECT().UpdateWorkflowStateStatus(
-		enumsspb.WORKFLOW_EXECUTION_STATE_RUNNING,
-		enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
-	).Return(true, nil).Times(1)
 	mutation, err := node.CloseTransaction()
 	s.NoError(err)
 	pVisibilityNode, ok := mutation.UpdatedNodes["Visibility"]
 	s.True(ok)
 	s.Len(pVisibilityNode.GetMetadata().GetComponentAttributes().SideEffectTasks, 1)
+	s.Equal(enumsspb.WORKFLOW_EXECUTION_STATE_RUNNING, s.nodeBackend.UpdateCalls[0].State)
+	s.Equal(enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING, s.nodeBackend.UpdateCalls[0].Status)
 
-	// Some change unrelated to visibility
-	// Visibility component should not be updated.
+	// Change ComponentData which is used as Memo. Even though lifecycle didn't change,
+	// visibility should be updated because memo changed.
 	nextTransitionCount = 2
 	testComponent, err = node.Component(chasmCtx, ComponentRef{componentPath: rootPath})
 	s.NoError(err)
 	testComponent.(*TestComponent).ComponentData = &protoMessageType{
 		CreateRequestId: "some-updated-component-data",
 	}
-	s.nodeBackend.EXPECT().UpdateWorkflowStateStatus(
-		enumsspb.WORKFLOW_EXECUTION_STATE_RUNNING,
-		enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
-	).Return(false, nil).Times(1)
+	s.nodeBackend.HandleUpdateWorkflowStateStatus = func(state enumsspb.WorkflowExecutionState, status enumspb.WorkflowExecutionStatus) (bool, error) {
+		return false, nil
+	}
 	mutation, err = node.CloseTransaction()
 	s.NoError(err)
-	_, ok = mutation.UpdatedNodes["Visibility"]
-	s.False(ok)
+	pVisibilityNode, ok = mutation.UpdatedNodes["Visibility"]
+	s.True(ok, "visibility should be updated when memo changes")
+	s.Len(pVisibilityNode.GetMetadata().GetComponentAttributes().SideEffectTasks, 1)
 
 	// Close the run, visibility should be force updated
 	// even if not explicitly updated.
@@ -1980,10 +2067,9 @@ func (s *nodeSuite) TestCloseTransaction_ForceUpdateVisibility_RootLifecycleChan
 	testComponent, err = node.Component(chasmCtx, ComponentRef{componentPath: rootPath})
 	s.NoError(err)
 	testComponent.(*TestComponent).Complete(chasmCtx)
-	s.nodeBackend.EXPECT().UpdateWorkflowStateStatus(
-		enumsspb.WORKFLOW_EXECUTION_STATE_COMPLETED,
-		enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
-	).Return(true, nil).Times(1)
+	s.nodeBackend.HandleUpdateWorkflowStateStatus = func(state enumsspb.WorkflowExecutionState, status enumspb.WorkflowExecutionStatus) (bool, error) {
+		return true, nil
+	}
 	mutation, err = node.CloseTransaction()
 	s.NoError(err)
 	pVisibilityNode, ok = mutation.UpdatedNodes["Visibility"]
@@ -1993,26 +2079,20 @@ func (s *nodeSuite) TestCloseTransaction_ForceUpdateVisibility_RootLifecycleChan
 
 func (s *nodeSuite) TestCloseTransaction_ForceUpdateVisibility_RootSAMemoChanged() {
 	node := s.testComponentTree()
-	tv := testvars.New(s.T())
-
 	chasmCtx := NewMutableContext(context.Background(), node)
 	testComponent, err := node.Component(chasmCtx, ComponentRef{componentPath: rootPath})
 	s.NoError(err)
 
 	nextTransitionCount := int64(1)
-	s.nodeBackend.EXPECT().NextTransitionCount().DoAndReturn(func() int64 {
+	s.nodeBackend.HandleNextTransitionCount = func() int64 {
 		return nextTransitionCount
-	}).AnyTimes()
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(1)).AnyTimes()
-	s.nodeBackend.EXPECT().GetWorkflowKey().Return(tv.Any().WorkflowKey()).AnyTimes()
-	s.nodeBackend.EXPECT().AddTasks(gomock.Any()).AnyTimes()
+	}
 
 	// Init visiblity component
 	testComponent.(*TestComponent).Visibility = NewComponentField(chasmCtx, NewVisibility(chasmCtx))
-	s.nodeBackend.EXPECT().UpdateWorkflowStateStatus(
-		enumsspb.WORKFLOW_EXECUTION_STATE_RUNNING,
-		enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
-	).Return(true, nil).Times(1)
+	s.nodeBackend.HandleUpdateWorkflowStateStatus = func(state enumsspb.WorkflowExecutionState, status enumspb.WorkflowExecutionStatus) (bool, error) {
+		return true, nil
+	}
 	mutation, err := node.CloseTransaction()
 	s.NoError(err)
 	pVisibilityNode, ok := mutation.UpdatedNodes["Visibility"]
@@ -2027,10 +2107,9 @@ func (s *nodeSuite) TestCloseTransaction_ForceUpdateVisibility_RootSAMemoChanged
 	testComponent.(*TestComponent).ComponentData = &protoMessageType{
 		StartTime: timestamppb.Now(),
 	}
-	s.nodeBackend.EXPECT().UpdateWorkflowStateStatus(
-		enumsspb.WORKFLOW_EXECUTION_STATE_RUNNING,
-		enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
-	).Return(false, nil).Times(1)
+	s.nodeBackend.HandleUpdateWorkflowStateStatus = func(state enumsspb.WorkflowExecutionState, status enumspb.WorkflowExecutionStatus) (bool, error) {
+		return false, nil
+	}
 	mutation, err = node.CloseTransaction()
 	s.NoError(err)
 	pVisibilityNode, ok = mutation.UpdatedNodes["Visibility"]
@@ -2052,17 +2131,17 @@ func (s *nodeSuite) TestCloseTransaction_InvalidateComponentTasks() {
 				LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 1},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_component",
+						TypeId: testComponentTypeID,
 						SideEffectTasks: []*persistencespb.ChasmComponentAttributes_Task{
 							{
-								Type:                      "TestLibrary.test_side_effect_task",
+								TypeId:                    testSideEffectTaskTypeID,
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
 								VersionedTransitionOffset: 1,
 								Data:                      taskBlob,
 								PhysicalTaskStatus:        physicalTaskStatusCreated,
 							},
 							{
-								Type:                      "TestLibrary.test_outbound_side_effect_task",
+								TypeId:                    testOutboundSideEffectTaskTypeID,
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
 								VersionedTransitionOffset: 2,
 								Data: &commonpb.DataBlob{
@@ -2074,7 +2153,7 @@ func (s *nodeSuite) TestCloseTransaction_InvalidateComponentTasks() {
 						},
 						PureTasks: []*persistencespb.ChasmComponentAttributes_Task{
 							{
-								Type:                      "TestLibrary.test_pure_task",
+								TypeId:                    testPureTaskTypeID,
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
 								VersionedTransitionOffset: 3,
 								Data:                      taskBlob,
@@ -2085,39 +2164,73 @@ func (s *nodeSuite) TestCloseTransaction_InvalidateComponentTasks() {
 				},
 			},
 		},
+		"SubComponent1": {
+			Metadata: &persistencespb.ChasmNodeMetadata{
+				InitialVersionedTransition:    &persistencespb.VersionedTransition{TransitionCount: 1},
+				LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 1},
+				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
+					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
+						TypeId: testSubComponent1TypeID,
+						SideEffectTasks: []*persistencespb.ChasmComponentAttributes_Task{
+							{
+								TypeId:                    testSideEffectTaskTypeID,
+								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
+								VersionedTransitionOffset: 4,
+								Data:                      taskBlob,
+								PhysicalTaskStatus:        physicalTaskStatusCreated,
+							},
+						},
+						PureTasks: []*persistencespb.ChasmComponentAttributes_Task{
+							{
+								TypeId:                    testPureTaskTypeID,
+								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
+								VersionedTransitionOffset: 5,
+								Data:                      taskBlob,
+								PhysicalTaskStatus:        physicalTaskStatusNone,
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 	root, err := s.newTestTree(persistenceNodes)
 	s.NoError(err)
 
+	nextTransitionCount := int64(2)
+	s.nodeBackend.HandleNextTransitionCount = func() int64 { return nextTransitionCount }
+
 	// The idea is to mark the node as dirty by accessing it with a mutable context.
-	// Otherwise, CloseTransaction logic will skip validating tasks for this node.
-	// This is a no-op change right now, since we are manually setting the LastUpdateVersionedTransition
-	// for the node below.
-	// Once CloseTransaction is fully implemented, this will be mark the node as dirty,
-	// and CloseTransaction logic will take care of updating LastUpdateVersionedTransition.
 	mutableContext := NewMutableContext(context.Background(), root)
 	_, err = root.Component(mutableContext, ComponentRef{})
 	s.NoError(err)
 
-	// TODO: remove this when CloseTransaction is fully implemented.
-	root.serializedNode.Metadata.LastUpdateVersionedTransition = &persistencespb.VersionedTransition{
-		TransitionCount: 2,
-	}
-
 	s.testLibrary.mockSideEffectTaskValidator.EXPECT().
-		Validate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(false, nil).Times(1)
+		Validate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(false, nil).Times(2)
 	s.testLibrary.mockOutboundSideEffectTaskValidator.EXPECT().
 		Validate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(true, nil).Times(1)
 	s.testLibrary.mockPureTaskValidator.EXPECT().
-		Validate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(false, nil).Times(1)
+		Validate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(false, nil).Times(2)
 
-	err = root.closeTransactionUpdateComponentTasks(&persistencespb.VersionedTransition{TransitionCount: 2})
+	mutation, err := root.CloseTransaction()
 	s.NoError(err)
+
+	s.Equal(tasks.MaximumKey.FireTime, s.nodeBackend.LastDeletePureTaskCall())
+
+	s.Len(mutation.UpdatedNodes, 2)
+	for _, updatedNode := range mutation.UpdatedNodes {
+		s.Equal(nextTransitionCount, updatedNode.GetMetadata().GetLastUpdateVersionedTransition().TransitionCount)
+	}
+	s.Empty(mutation.DeletedNodes)
 
 	componentAttr := root.serializedNode.Metadata.GetComponentAttributes()
 	s.Empty(componentAttr.PureTasks)
 	s.Len(componentAttr.SideEffectTasks, 1)
-	s.Equal("TestLibrary.test_outbound_side_effect_task", componentAttr.SideEffectTasks[0].GetType())
+	s.Equal(testOutboundSideEffectTaskTypeID, componentAttr.SideEffectTasks[0].GetTypeId())
+
+	componentAttr = root.children["SubComponent1"].serializedNode.Metadata.GetComponentAttributes()
+	s.Empty(componentAttr.PureTasks)
+	s.Empty(componentAttr.SideEffectTasks)
 }
 
 func (s *nodeSuite) TestCloseTransaction_NewComponentTasks() {
@@ -2128,7 +2241,7 @@ func (s *nodeSuite) TestCloseTransaction_NewComponentTasks() {
 				LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 1},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_component",
+						TypeId: testComponentTypeID,
 					},
 				},
 			},
@@ -2139,7 +2252,7 @@ func (s *nodeSuite) TestCloseTransaction_NewComponentTasks() {
 				LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 1},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_sub_component_1",
+						TypeId: testSubComponent1TypeID,
 					},
 				},
 			},
@@ -2150,12 +2263,17 @@ func (s *nodeSuite) TestCloseTransaction_NewComponentTasks() {
 				LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 1},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_sub_component_2",
+						TypeId: testSubComponent2TypeID,
 					},
 				},
 			},
 		},
 	}
+
+	s.nodeBackend.HandleNextTransitionCount = func() int64 {
+		return 2
+	}
+
 	root, err := s.newTestTree(persistenceNodes)
 	s.NoError(err)
 
@@ -2211,87 +2329,75 @@ func (s *nodeSuite) TestCloseTransaction_NewComponentTasks() {
 	// Add a valid outbound side effect task to a sub-component.
 	s.testLibrary.mockOutboundSideEffectTaskValidator.EXPECT().
 		Validate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(true, nil).Times(1)
-	subComponent2, err := testComponent.SubComponent2.Get(mutableContext)
-	s.NoError(err)
+	subComponent2 := testComponent.SubComponent2.Get(mutableContext)
 	mutableContext.AddTask(
 		subComponent2,
 		TaskAttributes{Destination: "destination"},
 		TestOutboundSideEffectTask{},
 	)
 
-	s.nodeBackend.EXPECT().GetWorkflowKey().Return(definition.WorkflowKey{
-		NamespaceID: "ns-id",
-		WorkflowID:  "wf-id",
-		RunID:       "run-id",
-	}).AnyTimes()
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(0)).AnyTimes()
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(2)).AnyTimes()
-	s.nodeBackend.EXPECT().UpdateWorkflowStateStatus(gomock.Any(), gomock.Any()).Return(false, nil).Times(1)
-
-	physicalTasks := make(map[tasks.Category][]tasks.Task)
-	s.nodeBackend.EXPECT().AddTasks(gomock.Any()).DoAndReturn(func(task tasks.Task) {
-		category := task.GetCategory()
-		physicalTasks[category] = append(physicalTasks[category], task)
-	}).AnyTimes()
-
 	mutation, err := root.CloseTransaction()
 	s.NoError(err)
+
+	s.Equal(s.timeSource.Now().UTC(), s.nodeBackend.LastDeletePureTaskCall())
 
 	rootAttr := mutation.UpdatedNodes[""].GetMetadata().GetComponentAttributes()
 	s.Len(rootAttr.SideEffectTasks, 1) // Only one valid side effect task.
 	newSideEffectTask := rootAttr.SideEffectTasks[0]
 	newSideEffectTask.Data = nil // This is tested by TestSerializeTask()
 	s.Equal(&persistencespb.ChasmComponentAttributes_Task{
-		Type:                      "TestLibrary.test_side_effect_task",
+		TypeId:                    testSideEffectTaskTypeID,
 		ScheduledTime:             timestamppb.New(time.Time{}),
 		VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 2},
 		VersionedTransitionOffset: 1,
 		PhysicalTaskStatus:        physicalTaskStatusCreated,
 	}, newSideEffectTask)
-	s.Len(physicalTasks[tasks.CategoryTransfer], 1)
-	chasmTask := physicalTasks[tasks.CategoryTransfer][0].(*tasks.ChasmTask)
+	s.Len(s.nodeBackend.TasksByCategory[tasks.CategoryTransfer], 1)
+	chasmTask := s.nodeBackend.TasksByCategory[tasks.CategoryTransfer][0].(*tasks.ChasmTask)
 	s.ProtoEqual(&persistencespb.ChasmTaskInfo{
 		ComponentInitialVersionedTransition:    &persistencespb.VersionedTransition{TransitionCount: 1},
 		ComponentLastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 2},
 		Path:                                   rootPath,
-		Type:                                   "TestLibrary.test_side_effect_task",
+		TypeId:                                 testSideEffectTaskTypeID,
 		Data:                                   chasmTask.Info.GetData(), // This is tested by TestSerializeTask()
+		ArchetypeId:                            testComponentTypeID,
 	}, chasmTask.Info)
 
 	s.Len(rootAttr.PureTasks, 1) // Only one valid side effect task.
 	newPureTask := rootAttr.PureTasks[0]
 	newPureTask.Data = nil // This is tested by TestSerializeTask()
 	s.Equal(&persistencespb.ChasmComponentAttributes_Task{
-		Type:                      "TestLibrary.test_pure_task",
+		TypeId:                    testPureTaskTypeID,
 		ScheduledTime:             timestamppb.New(s.timeSource.Now()),
 		VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 2},
 		VersionedTransitionOffset: 2,
 		PhysicalTaskStatus:        physicalTaskStatusCreated,
 	}, newPureTask)
-	s.Len(physicalTasks[tasks.CategoryTimer], 1)
-	chasmPureTask := physicalTasks[tasks.CategoryTimer][0].(*tasks.ChasmTaskPure)
-	s.Equal(tasks.CategoryTimer, chasmPureTask.Category)
+	s.Len(s.nodeBackend.TasksByCategory[tasks.CategoryTimer], 1)
+	chasmPureTask := s.nodeBackend.TasksByCategory[tasks.CategoryTimer][0].(*tasks.ChasmTaskPure)
+	s.Equal(tasks.CategoryTimer, chasmPureTask.GetCategory())
 	s.True(chasmPureTask.VisibilityTimestamp.Equal(s.timeSource.Now()))
 
 	subComponent2Attr := mutation.UpdatedNodes["SubComponent2"].GetMetadata().GetComponentAttributes()
 	newOutboundSideEffectTask := subComponent2Attr.SideEffectTasks[0]
 	newOutboundSideEffectTask.Data = nil // This is tested by TestSerializeTask()
 	s.Equal(&persistencespb.ChasmComponentAttributes_Task{
-		Type:                      "TestLibrary.test_outbound_side_effect_task",
+		TypeId:                    testOutboundSideEffectTaskTypeID,
 		Destination:               "destination",
 		ScheduledTime:             timestamppb.New(time.Time{}),
 		VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 2},
 		VersionedTransitionOffset: 3,
 		PhysicalTaskStatus:        physicalTaskStatusCreated,
 	}, newOutboundSideEffectTask)
-	s.Len(physicalTasks[tasks.CategoryOutbound], 1)
-	chasmTask = physicalTasks[tasks.CategoryOutbound][0].(*tasks.ChasmTask)
+	s.Len(s.nodeBackend.TasksByCategory[tasks.CategoryOutbound], 1)
+	chasmTask = s.nodeBackend.TasksByCategory[tasks.CategoryOutbound][0].(*tasks.ChasmTask)
 	s.ProtoEqual(&persistencespb.ChasmTaskInfo{
 		ComponentInitialVersionedTransition:    &persistencespb.VersionedTransition{TransitionCount: 1},
 		ComponentLastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 2},
 		Path:                                   []string{"SubComponent2"},
-		Type:                                   "TestLibrary.test_outbound_side_effect_task",
+		TypeId:                                 testOutboundSideEffectTaskTypeID,
 		Data:                                   chasmTask.Info.GetData(), // This is tested by TestSerializeTask()
+		ArchetypeId:                            testComponentTypeID,
 	}, chasmTask.Info)
 }
 
@@ -2303,10 +2409,10 @@ func (s *nodeSuite) TestCloseTransaction_ApplyMutation_SideEffectTasks() {
 				LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 1},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_component",
+						TypeId: testComponentTypeID,
 						SideEffectTasks: []*persistencespb.ChasmComponentAttributes_Task{
 							{
-								Type:                      "TestLibrary.test_side_effect_task",
+								TypeId:                    testSideEffectTaskTypeID,
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
 								VersionedTransitionOffset: 1,
 								PhysicalTaskStatus:        physicalTaskStatusCreated,
@@ -2326,22 +2432,22 @@ func (s *nodeSuite) TestCloseTransaction_ApplyMutation_SideEffectTasks() {
 					LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 2},
 					Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 						ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-							Type: "TestLibrary.test_component",
+							TypeId: testComponentTypeID,
 							SideEffectTasks: []*persistencespb.ChasmComponentAttributes_Task{
 								{
-									Type:                      "TestLibrary.test_side_effect_task",
+									TypeId:                    testSideEffectTaskTypeID,
 									VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
 									VersionedTransitionOffset: 1,
 									PhysicalTaskStatus:        physicalTaskStatusCreated,
 								},
 								{
-									Type:                      "TestLibrary.test_side_effect_task",
+									TypeId:                    testSideEffectTaskTypeID,
 									VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 2},
 									VersionedTransitionOffset: 1,
 									PhysicalTaskStatus:        physicalTaskStatusNone,
 								},
 								{
-									Type:                      "TestLibrary.test_side_effect_task",
+									TypeId:                    testSideEffectTaskTypeID,
 									Destination:               "destination",
 									ScheduledTime:             timestamppb.New(TaskScheduledTimeImmediate),
 									VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 2},
@@ -2349,7 +2455,7 @@ func (s *nodeSuite) TestCloseTransaction_ApplyMutation_SideEffectTasks() {
 									PhysicalTaskStatus:        physicalTaskStatusNone,
 								},
 								{
-									Type:                      "TestLibrary.test_side_effect_task",
+									TypeId:                    testSideEffectTaskTypeID,
 									ScheduledTime:             timestamppb.New(s.timeSource.Now().Add(time.Minute)),
 									VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 2},
 									VersionedTransitionOffset: 3,
@@ -2369,28 +2475,20 @@ func (s *nodeSuite) TestCloseTransaction_ApplyMutation_SideEffectTasks() {
 	err = root.ApplyMutation(incomingMutation)
 	s.NoError(err)
 
-	s.nodeBackend.EXPECT().GetWorkflowKey().Return(definition.WorkflowKey{
-		NamespaceID: "ns-id",
-		WorkflowID:  "wf-id",
-		RunID:       "run-id",
-	}).AnyTimes()
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(0)).AnyTimes()
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(3)).AnyTimes()
-
 	expectedCategories := []tasks.Category{tasks.CategoryTimer, tasks.CategoryOutbound, tasks.CategoryTransfer}
+	_, err = root.CloseTransaction()
 	for _, category := range expectedCategories {
-		s.nodeBackend.EXPECT().AddTasks(gomock.Any()).Do(func(addedTask tasks.Task) {
-			s.IsType(&tasks.ChasmTask{}, addedTask)
-			s.Equal(category, addedTask.GetCategory())
-		})
+		for _, task := range s.nodeBackend.TasksByCategory[category] {
+			s.IsType(&tasks.ChasmTask{}, task)
+			s.Equal(category, task.GetCategory())
+		}
 	}
 
-	_, err = root.CloseTransaction()
 	s.NoError(err)
 }
 
 func (s *nodeSuite) TestCloseTransaction_ApplyMutation_PureTasks() {
-	now := s.timeSource.Now()
+	now := s.timeSource.Now().UTC()
 	persistenceNodes := map[string]*persistencespb.ChasmNode{
 		"": {
 			Metadata: &persistencespb.ChasmNodeMetadata{
@@ -2398,10 +2496,10 @@ func (s *nodeSuite) TestCloseTransaction_ApplyMutation_PureTasks() {
 				LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 1},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_component",
+						TypeId: testComponentTypeID,
 						PureTasks: []*persistencespb.ChasmComponentAttributes_Task{
 							{
-								Type:                      "TestLibrary.test_pure_task",
+								TypeId:                    testPureTaskTypeID,
 								ScheduledTime:             timestamppb.New(now.Add(time.Second)),
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
 								VersionedTransitionOffset: 1,
@@ -2418,10 +2516,10 @@ func (s *nodeSuite) TestCloseTransaction_ApplyMutation_PureTasks() {
 				LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 1},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_sub_component_1",
+						TypeId: testSubComponent1TypeID,
 						PureTasks: []*persistencespb.ChasmComponentAttributes_Task{
 							{
-								Type:                      "TestLibrary.test_pure_task",
+								TypeId:                    testPureTaskTypeID,
 								ScheduledTime:             timestamppb.New(now.Add(time.Minute)),
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
 								VersionedTransitionOffset: 2,
@@ -2442,10 +2540,10 @@ func (s *nodeSuite) TestCloseTransaction_ApplyMutation_PureTasks() {
 					LastUpdateVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 2},
 					Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 						ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-							Type: "TestLibrary.test_component",
+							TypeId: testComponentTypeID,
 							PureTasks: []*persistencespb.ChasmComponentAttributes_Task{
 								{
-									Type:                      "TestLibrary.test_pure_task",
+									TypeId:                    testPureTaskTypeID,
 									ScheduledTime:             timestamppb.New(now.Add(2 * time.Minute)),
 									VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 2},
 									VersionedTransitionOffset: 1,
@@ -2465,59 +2563,43 @@ func (s *nodeSuite) TestCloseTransaction_ApplyMutation_PureTasks() {
 	err = root.ApplyMutation(incomingMutation)
 	s.NoError(err)
 
-	s.nodeBackend.EXPECT().GetWorkflowKey().Return(definition.WorkflowKey{
-		NamespaceID: "ns-id",
-		WorkflowID:  "wf-id",
-		RunID:       "run-id",
-	}).AnyTimes()
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(0)).AnyTimes()
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(3)).AnyTimes()
-
-	s.nodeBackend.EXPECT().AddTasks(gomock.Any()).Do(func(addedTask tasks.Task) {
-		s.IsType(&tasks.ChasmTaskPure{}, addedTask)
-		s.Equal(tasks.CategoryTimer, addedTask.GetCategory())
-		s.True(now.Add(time.Minute).Equal(addedTask.GetKey().FireTime))
-	}).Times(1)
-
 	mutation, err := root.CloseTransaction()
 	s.NoError(err)
+
+	s.Equal(now.Add(time.Minute), s.nodeBackend.LastDeletePureTaskCall())
 
 	// Although only root is mutated in ApplyMutation, we generated a pure task for the child node,
 	// and need to persist that as well.
 	s.Len(mutation.UpdatedNodes, 2)
+
+	s.Len(s.nodeBackend.TasksByCategory[tasks.CategoryTimer], 1)
+	task := s.nodeBackend.TasksByCategory[tasks.CategoryTimer][0]
+	s.IsType(&tasks.ChasmTaskPure{}, task)
+	s.True(now.Add(time.Minute).Equal(task.GetKey().FireTime))
 }
 
 func (s *nodeSuite) TestTerminate() {
 	node := s.testComponentTree()
-	tv := testvars.New(s.T())
-
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(1)).AnyTimes()
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(1)).AnyTimes()
-	s.nodeBackend.EXPECT().GetWorkflowKey().Return(tv.Any().WorkflowKey()).AnyTimes()
 
 	// First closeTransaction once to make the tree clean.
-	s.nodeBackend.EXPECT().UpdateWorkflowStateStatus(
-		enumsspb.WORKFLOW_EXECUTION_STATE_RUNNING,
-		enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
-	).Return(false, nil).Times(1)
-
 	_, err := node.CloseTransaction()
 	s.NoError(err)
+
+	s.Equal(enumsspb.WORKFLOW_EXECUTION_STATE_RUNNING, s.nodeBackend.LastUpdateWorkflowState())
+	s.Equal(enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING, s.nodeBackend.LastUpdateWorkflowStatus())
 
 	// Then terminate the node and verify only that node will be in the mutation.
 	err = node.Terminate(TerminateComponentRequest{})
 	s.NoError(err)
 	s.True(node.terminated)
 
-	s.nodeBackend.EXPECT().UpdateWorkflowStateStatus(
-		enumsspb.WORKFLOW_EXECUTION_STATE_COMPLETED,
-		enumspb.WORKFLOW_EXECUTION_STATUS_TERMINATED,
-	).Return(true, nil).Times(1)
-
 	mutations, err := node.CloseTransaction()
 	s.NoError(err)
 	s.Len(mutations.UpdatedNodes, 1)
 	s.Empty(mutations.DeletedNodes)
+	s.Equal(enumsspb.WORKFLOW_EXECUTION_STATE_COMPLETED, s.nodeBackend.LastUpdateWorkflowState())
+	s.Equal(enumspb.WORKFLOW_EXECUTION_STATUS_TERMINATED, s.nodeBackend.LastUpdateWorkflowStatus())
+
 }
 
 func (s *nodeSuite) preorderAndAssertParent(
@@ -2584,8 +2666,8 @@ func (s *nodeSuite) nodeBase() *nodeBase {
 
 // Helper method to create a test tree for TestComponent.
 func (s *nodeSuite) testComponentTree() *Node {
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(1)).Times(1) // for InitialVersionedTransition of the root component.
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(1)).Times(1)
+	s.nodeBackend.HandleNextTransitionCount = func() int64 { return 1 }
+	s.nodeBackend.HandleGetCurrentVersion = func() int64 { return 1 }
 
 	var nilSerializedNodes map[string]*persistencespb.ChasmNode
 	// Create an empty tree.
@@ -2607,8 +2689,6 @@ func (s *nodeSuite) testComponentTree() *Node {
 	setTestComponentFields(tc.(*TestComponent), s.nodeBackend)
 
 	// Sync tree with subcomponents of TestComponent.
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(1)).Times(4) // for InitialVersionedTransition of children.
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(1)).Times(4)
 	err = node.syncSubComponents()
 	s.False(node.needsPointerResolution)
 	s.NoError(err)
@@ -2618,13 +2698,7 @@ func (s *nodeSuite) testComponentTree() *Node {
 }
 
 func (s *nodeSuite) TestExecuteImmediatePureTask() {
-	tv := testvars.New(s.T())
 	root := s.testComponentTree()
-
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(1)).AnyTimes()
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(1)).AnyTimes()
-	s.nodeBackend.EXPECT().GetWorkflowKey().Return(tv.Any().WorkflowKey()).AnyTimes()
-	s.nodeBackend.EXPECT().UpdateWorkflowStateStatus(gomock.Any(), gomock.Any()).Return(false, nil).AnyTimes()
 
 	mutations, err := root.CloseTransaction()
 	s.NoError(err)
@@ -2645,8 +2719,7 @@ func (s *nodeSuite) TestExecuteImmediatePureTask() {
 		},
 	)
 
-	sc1, err := testComponent.SubComponent1.Get(mutableContext)
-	s.NoError(err)
+	sc1 := testComponent.SubComponent1.Get(mutableContext)
 
 	mutableContext.AddTask(
 		sc1,
@@ -2663,7 +2736,7 @@ func (s *nodeSuite) TestExecuteImmediatePureTask() {
 		Validate(gomock.Any(), gomock.Any(), gomock.Eq(taskAttributes), gomock.Any()).Return(true, nil).Times(1)
 	s.testLibrary.mockPureTaskExecutor.EXPECT().
 		Execute(
-			gomock.AssignableToTypeOf(&MutableContextImpl{}),
+			gomock.AssignableToTypeOf(&mutableCtx{}),
 			gomock.Any(),
 			gomock.Eq(taskAttributes),
 			gomock.Any(),
@@ -2673,6 +2746,9 @@ func (s *nodeSuite) TestExecuteImmediatePureTask() {
 	s.NoError(err)
 	s.Len(mutations.UpdatedNodes, 2, "root and subcomponent1 should be updated")
 	s.Empty(mutations.DeletedNodes)
+
+	// immedidate pure tasks will be executed inline and no physical chasm pure task will be generated.
+	s.Equal(tasks.MaximumKey.FireTime, s.nodeBackend.LastDeletePureTaskCall())
 }
 
 func (s *nodeSuite) TestEachPureTask() {
@@ -2691,11 +2767,11 @@ func (s *nodeSuite) TestEachPureTask() {
 				InitialVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 1},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_component",
+						TypeId: testComponentTypeID,
 						PureTasks: []*persistencespb.ChasmComponentAttributes_Task{
 							{
 								// Expired
-								Type:                      "TestLibrary.test_pure_task",
+								TypeId:                    testPureTaskTypeID,
 								ScheduledTime:             timestamppb.New(now),
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
 								VersionedTransitionOffset: 1,
@@ -2714,10 +2790,10 @@ func (s *nodeSuite) TestEachPureTask() {
 				InitialVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 1},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_sub_component_1",
+						TypeId: testSubComponent1TypeID,
 						PureTasks: []*persistencespb.ChasmComponentAttributes_Task{
 							{
-								Type: "TestLibrary.test_pure_task",
+								TypeId: testPureTaskTypeID,
 								// Not expired yet.
 								ScheduledTime:             timestamppb.New(now.Add(time.Hour)),
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
@@ -2737,10 +2813,10 @@ func (s *nodeSuite) TestEachPureTask() {
 				InitialVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 1},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_sub_component_11",
+						TypeId: testSubComponent11TypeID,
 						PureTasks: []*persistencespb.ChasmComponentAttributes_Task{
 							{
-								Type: "TestLibrary.test_pure_task",
+								TypeId: testPureTaskTypeID,
 								// Expired, and physical task not created
 								ScheduledTime:             timestamppb.New(now),
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
@@ -2751,14 +2827,26 @@ func (s *nodeSuite) TestEachPureTask() {
 								}),
 							},
 							{
-								Type: "TestLibrary.test_pure_task",
-								// Expired
+								TypeId: testPureTaskTypeID,
+								// Expired, but when processing this task, delete the SubComponent11 itself.
 								ScheduledTime:             timestamppb.New(now),
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
 								VersionedTransitionOffset: 4,
 								PhysicalTaskStatus:        physicalTaskStatusCreated,
 								Data: mustEncode(&commonpb.Payload{
 									Data: []byte("some-random-data-sc11-2"),
+								}),
+							},
+							{
+								TypeId: testPureTaskTypeID,
+								// Expired, but should not be executed because previous task deletes SubComponent1
+								// (this node's parent).
+								ScheduledTime:             timestamppb.New(now),
+								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
+								VersionedTransitionOffset: 5,
+								PhysicalTaskStatus:        physicalTaskStatusCreated,
+								Data: mustEncode(&commonpb.Payload{
+									Data: []byte("some-random-data-sc11-3"),
 								}),
 							},
 						},
@@ -2771,15 +2859,15 @@ func (s *nodeSuite) TestEachPureTask() {
 				InitialVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 1},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_sub_component_2",
+						TypeId: testSubComponent2TypeID,
 						PureTasks: []*persistencespb.ChasmComponentAttributes_Task{
 							{
-								Type: "TestLibrary.test_pure_task",
+								TypeId: testPureTaskTypeID,
 								// Expired. However, this task won't be executed because the node is deleted
 								// when processing the pure task from the root component.
 								ScheduledTime:             timestamppb.New(now),
 								VersionedTransition:       &persistencespb.VersionedTransition{TransitionCount: 1},
-								VersionedTransitionOffset: 5,
+								VersionedTransitionOffset: 6,
 								PhysicalTaskStatus:        physicalTaskStatusCreated,
 								Data: mustEncode(&commonpb.Payload{
 									Data: []byte("some-random-data-sc2"),
@@ -2796,7 +2884,7 @@ func (s *nodeSuite) TestEachPureTask() {
 	s.NoError(err)
 	s.NotNil(root)
 
-	actualTaskCount := 0
+	processedTaskData := [][]byte{}
 	err = root.EachPureTask(now.Add(time.Minute), func(executor NodePureTask, taskAttributes TaskAttributes, task any) (bool, error) {
 		s.NotNil(executor)
 		s.NotNil(taskAttributes)
@@ -2804,8 +2892,9 @@ func (s *nodeSuite) TestEachPureTask() {
 		testPureTask, ok := task.(*TestPureTask)
 		s.True(ok)
 
-		actualTaskCount += 1
+		processedTaskData = append(processedTaskData, testPureTask.Payload.Data)
 
+		// When processing root component task, delete SubComponent2 to verify its task is not executed.
 		if slices.Equal(
 			testPureTask.Payload.Data,
 			[]byte("some-random-data-root"),
@@ -2814,15 +2903,30 @@ func (s *nodeSuite) TestEachPureTask() {
 			rootComponent, err := root.Component(mutableContext, ComponentRef{})
 			s.NoError(err)
 
-			// delete
-			rootComponent.(*TestComponent).SubComponent2 = Field[*TestSubComponent2]{}
+			rootComponent.(*TestComponent).SubComponent2 = NewEmptyField[*TestSubComponent2]()
+		}
+
+		// When processing task for SubComponent11, delete its parent SubComponent1 so that the remaining task is not executed.
+		if slices.Equal(
+			testPureTask.Payload.Data,
+			[]byte("some-random-data-sc11-2"),
+		) {
+			mutableContext := NewMutableContext(context.Background(), root)
+			rootComponent, err := root.Component(mutableContext, ComponentRef{})
+			s.NoError(err)
+
+			rootComponent.(*TestComponent).SubComponent1 = NewEmptyField[*TestSubComponent1]()
 		}
 
 		return true, nil
 	})
 	s.NoError(err)
-	s.Equal(3, actualTaskCount)
-	s.Len(root.taskValueCache, actualTaskCount)
+	s.Equal([][]byte{
+		[]byte("some-random-data-root"),
+		[]byte("some-random-data-sc11-1"),
+		[]byte("some-random-data-sc11-2"),
+	}, processedTaskData)
+	s.Len(root.taskValueCache, 1) // only one task from root component
 }
 
 func (s *nodeSuite) TestExecutePureTask() {
@@ -2832,7 +2936,7 @@ func (s *nodeSuite) TestExecutePureTask() {
 				InitialVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 1},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_component",
+						TypeId: testComponentTypeID,
 					},
 				},
 			},
@@ -2854,7 +2958,7 @@ func (s *nodeSuite) TestExecutePureTask() {
 	expectExecute := func(result error) {
 		s.testLibrary.mockPureTaskExecutor.EXPECT().
 			Execute(
-				gomock.AssignableToTypeOf(&MutableContextImpl{}),
+				gomock.AssignableToTypeOf(&mutableCtx{}),
 				gomock.AssignableToTypeOf(&TestComponent{}),
 				gomock.Eq(taskAttributes),
 				gomock.Eq(pureTask),
@@ -2867,42 +2971,104 @@ func (s *nodeSuite) TestExecutePureTask() {
 	}
 
 	// Succeed task execution and validation (happy case).
+	root.setValueState(valueStateSynced)
 	expectExecute(nil)
 	expectValidate(true, nil)
 	executed, err := root.ExecutePureTask(ctx, taskAttributes, pureTask)
 	s.NoError(err)
 	s.True(executed)
+	s.Equal(valueStateNeedSyncStructure, root.valueState)
 
 	expectedErr := errors.New("dummy")
 
 	// Succeed validation, fail execution.
+	root.setValueState(valueStateSynced)
 	expectExecute(expectedErr)
 	expectValidate(true, nil)
 	_, err = root.ExecutePureTask(ctx, taskAttributes, pureTask)
 	s.ErrorIs(expectedErr, err)
+	s.Equal(valueStateNeedSyncStructure, root.valueState)
 
 	// Fail task validation (no execution occurs).
+	root.setValueState(valueStateSynced)
 	expectValidate(false, nil)
 	executed, err = root.ExecutePureTask(ctx, taskAttributes, pureTask)
 	s.NoError(err)
 	s.False(executed)
+	s.Equal(valueStateSynced, root.valueState) // task not executed, so node is clean
 
 	// Error during task validation (no execution occurs).
+	root.setValueState(valueStateSynced)
 	expectValidate(false, expectedErr)
 	_, err = root.ExecutePureTask(ctx, taskAttributes, pureTask)
 	s.ErrorIs(expectedErr, err)
+	s.Equal(valueStateSynced, root.valueState) // task not executed, so node is clean
+}
+
+func (s *nodeSuite) TestValidatePureTask() {
+	taskAttributes := TaskAttributes{}
+	pureTask := &TestPureTask{
+		Payload: &commonpb.Payload{
+			Data: []byte("some-random-data"),
+		},
+	}
+
+	root := s.testComponentTree()
+	_, err := root.CloseTransaction()
+	s.NoError(err)
+
+	ctx := context.Background()
+	expectValidate := func(retValue bool, errValue error) {
+		s.testLibrary.mockPureTaskValidator.EXPECT().
+			Validate(gomock.Any(), gomock.Any(), gomock.Eq(taskAttributes), gomock.Any()).Return(retValue, errValue).Times(1)
+	}
+
+	// Succeed task validation (happy case).
+	expectValidate(true, nil)
+	valid, err := root.ValidatePureTask(ctx, taskAttributes, pureTask)
+	s.NoError(err)
+	s.True(valid)
+	s.Equal(valueStateSynced, root.valueState) // node is always clean for task validation
+
+	// Invalid task (validation returns false).
+	expectValidate(false, nil)
+	valid, err = root.ValidatePureTask(ctx, taskAttributes, pureTask)
+	s.NoError(err)
+	s.False(valid)
+	s.Equal(valueStateSynced, root.valueState) // node is always clean for task validation
+
+	// Error during task validation (no execution occurs).
+	expectedErr := errors.New("dummy")
+	expectValidate(false, expectedErr)
+	_, err = root.ValidatePureTask(ctx, taskAttributes, pureTask)
+	s.ErrorIs(expectedErr, err)
+	s.Equal(valueStateSynced, root.valueState) // node is always clean for task validation
+
+	// Close the root component.
+	mutableCtx := NewMutableContext(ctx, root)
+	rootComponent, err := root.ComponentByPath(mutableCtx, rootPath)
+	s.NoError(err)
+	rootComponent.(*TestComponent).Complete(mutableCtx)
+	_, err = root.CloseTransaction()
+	s.NoError(err)
+
+	// Invalid task for sub-component due to access rule.
+	subComponent1, ok := root.children["SubComponent1"]
+	s.True(ok)
+	valid, err = subComponent1.ValidatePureTask(ctx, taskAttributes, pureTask)
+	s.NoError(err)
+	s.False(valid)
+	s.Equal(valueStateSynced, subComponent1.valueState) // node is always clean for task validation
 }
 
 func (s *nodeSuite) TestExecuteSideEffectTask() {
-	tv := testvars.New(s.T())
-
 	persistenceNodes := map[string]*persistencespb.ChasmNode{
 		"": {
 			Metadata: &persistencespb.ChasmNodeMetadata{
 				InitialVersionedTransition: &persistencespb.VersionedTransition{TransitionCount: 1},
 				Attributes: &persistencespb.ChasmNodeMetadata_ComponentAttributes{
 					ComponentAttributes: &persistencespb.ChasmComponentAttributes{
-						Type: "TestLibrary.test_component",
+						TypeId: testComponentTypeID,
 					},
 				},
 			},
@@ -2916,25 +3082,30 @@ func (s *nodeSuite) TestExecuteSideEffectTask() {
 		ComponentLastUpdateVersionedTransition: &persistencespb.VersionedTransition{
 			TransitionCount: 1,
 		},
-		Path: rootPath,
-		Type: "TestLibrary.test_side_effect_task",
+		Path:   rootPath,
+		TypeId: testSideEffectTaskTypeID,
 		Data: &commonpb.DataBlob{
 			Data:         nil,
 			EncodingType: enumspb.ENCODING_TYPE_PROTO3,
 		},
 	}
+	workflowKey := definition.NewWorkflowKey(
+		primitives.NewUUID().String(),
+		primitives.NewUUID().String(),
+		primitives.NewUUID().String(),
+	)
 	chasmTask := &tasks.ChasmTask{
-		WorkflowKey:         tv.Any().WorkflowKey(),
+		WorkflowKey:         workflowKey,
 		VisibilityTimestamp: s.timeSource.Now(),
 		TaskID:              123,
 		Category:            tasks.CategoryOutbound,
 		Destination:         "destination",
 		Info:                taskInfo,
 	}
-	entityKey := EntityKey{
+	executionKey := ExecutionKey{
 		NamespaceID: chasmTask.NamespaceID,
 		BusinessID:  chasmTask.WorkflowID,
-		EntityID:    chasmTask.RunID,
+		RunID:       chasmTask.RunID,
 	}
 
 	root, err := s.newTestTree(persistenceNodes)
@@ -2986,7 +3157,7 @@ func (s *nodeSuite) TestExecuteSideEffectTask() {
 	// Succeed task execution.
 	expectValidate(true, nil)
 	expectExecute(nil)
-	err = root.ExecuteSideEffectTask(ctx, s.registry, entityKey, chasmTask, dummyValidationFn)
+	err = root.ExecuteSideEffectTask(ctx, s.registry, executionKey, chasmTask, dummyValidationFn)
 	s.NoError(err)
 	s.True(backendValidtionFnCalled)
 	s.True(chasmTask.DeserializedTask.IsValid())
@@ -2994,7 +3165,7 @@ func (s *nodeSuite) TestExecuteSideEffectTask() {
 	// Invalid task.
 	expectValidate(false, nil)
 	expectExecute(nil)
-	err = root.ExecuteSideEffectTask(ctx, s.registry, entityKey, chasmTask, dummyValidationFn)
+	err = root.ExecuteSideEffectTask(ctx, s.registry, executionKey, chasmTask, dummyValidationFn)
 	s.Error(err)
 	s.IsType(&serviceerror.NotFound{}, err)
 	s.True(chasmTask.DeserializedTask.IsValid())
@@ -3003,7 +3174,7 @@ func (s *nodeSuite) TestExecuteSideEffectTask() {
 	validationErr := errors.New("validation error")
 	expectValidate(false, validationErr)
 	expectExecute(nil)
-	err = root.ExecuteSideEffectTask(ctx, s.registry, entityKey, chasmTask, dummyValidationFn)
+	err = root.ExecuteSideEffectTask(ctx, s.registry, executionKey, chasmTask, dummyValidationFn)
 	s.ErrorIs(validationErr, err)
 	s.False(chasmTask.DeserializedTask.IsValid())
 
@@ -3011,15 +3182,13 @@ func (s *nodeSuite) TestExecuteSideEffectTask() {
 	expectValidate(true, nil)
 	executionErr := errors.New("execution error")
 	expectExecute(executionErr)
-	err = root.ExecuteSideEffectTask(ctx, s.registry, entityKey, chasmTask, dummyValidationFn)
+	err = root.ExecuteSideEffectTask(ctx, s.registry, executionKey, chasmTask, dummyValidationFn)
 	s.ErrorIs(executionErr, err)
 	s.True(backendValidtionFnCalled)
 	s.False(chasmTask.DeserializedTask.IsValid())
 }
 
 func (s *nodeSuite) TestValidateSideEffectTask() {
-	tv := testvars.New(s.T())
-
 	taskInfo := &persistencespb.ChasmTaskInfo{
 		ComponentInitialVersionedTransition: &persistencespb.VersionedTransition{
 			TransitionCount:          1,
@@ -3029,15 +3198,20 @@ func (s *nodeSuite) TestValidateSideEffectTask() {
 			TransitionCount:          1,
 			NamespaceFailoverVersion: 1,
 		},
-		Path: rootPath,
-		Type: "TestLibrary.test_side_effect_task",
+		Path:   rootPath,
+		TypeId: testSideEffectTaskTypeID,
 		Data: &commonpb.DataBlob{
 			Data:         nil,
 			EncodingType: enumspb.ENCODING_TYPE_PROTO3,
 		},
 	}
+	workflowKey := definition.NewWorkflowKey(
+		primitives.NewUUID().String(),
+		primitives.NewUUID().String(),
+		primitives.NewUUID().String(),
+	)
 	chasmTask := &tasks.ChasmTask{
-		WorkflowKey:         tv.Any().WorkflowKey(),
+		WorkflowKey:         workflowKey,
 		VisibilityTimestamp: s.timeSource.Now(),
 		TaskID:              123,
 		Category:            tasks.CategoryTransfer,
@@ -3052,7 +3226,7 @@ func (s *nodeSuite) TestValidateSideEffectTask() {
 	expectValidate := func(componentType any, retValue bool, errValue error) {
 		s.testLibrary.mockSideEffectTaskValidator.EXPECT().
 			Validate(
-				gomock.AssignableToTypeOf((*ContextImpl)(nil)),
+				gomock.AssignableToTypeOf((*immutableCtx)(nil)),
 				gomock.AssignableToTypeOf(componentType),
 				gomock.Eq(TaskAttributes{
 					ScheduledTime: chasmTask.GetVisibilityTime(),
@@ -3087,8 +3261,13 @@ func (s *nodeSuite) TestValidateSideEffectTask() {
 	// Succeed validation as valid for a sub component.
 	childTaskInfo := taskInfo
 	childTaskInfo.Path = []string{"SubComponent1"}
+	childWorkflowKey := definition.NewWorkflowKey(
+		primitives.NewUUID().String(),
+		primitives.NewUUID().String(),
+		primitives.NewUUID().String(),
+	)
 	childChasmTask := &tasks.ChasmTask{
-		WorkflowKey:         tv.Any().WorkflowKey(),
+		WorkflowKey:         childWorkflowKey,
 		VisibilityTimestamp: s.timeSource.Now(),
 		TaskID:              124,
 		Category:            tasks.CategoryTransfer,
@@ -3099,10 +3278,25 @@ func (s *nodeSuite) TestValidateSideEffectTask() {
 	s.True(isValid)
 	s.NoError(err)
 	s.True(childChasmTask.DeserializedTask.IsValid())
+
+	// Succeed validation as invalid since parent is closed.
+	mutableCtx := NewMutableContext(ctx, root)
+	rootComponent, err := root.ComponentByPath(mutableCtx, rootPath)
+	s.NoError(err)
+	rootComponent.(*TestComponent).Complete(mutableCtx)
+	// Note there's also no mock for task validator here in this case.
+	// Access rule is checked first.
+	isValid, err = root.ValidateSideEffectTask(ctx, childChasmTask)
+	s.False(isValid)
+	s.NoError(err)
+	s.True(childChasmTask.DeserializedTask.IsValid())
 }
 
 func (s *nodeSuite) newTestTree(
 	serializedNodes map[string]*persistencespb.ChasmNode,
 ) (*Node, error) {
-	return NewTree(serializedNodes, s.registry, s.timeSource, s.nodeBackend, s.nodePathEncoder, s.logger)
+	if len(serializedNodes) == 0 {
+		return NewEmptyTree(s.registry, s.timeSource, s.nodeBackend, s.nodePathEncoder, s.logger), nil
+	}
+	return NewTreeFromDB(serializedNodes, s.registry, s.timeSource, s.nodeBackend, s.nodePathEncoder, s.logger)
 }

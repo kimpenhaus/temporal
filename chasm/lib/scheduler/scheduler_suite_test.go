@@ -15,8 +15,9 @@ import (
 	"go.temporal.io/server/common/testing/protorequire"
 	"go.temporal.io/server/common/testing/testlogger"
 	"go.temporal.io/server/common/testing/testvars"
-	"go.temporal.io/server/service/history/tasks"
+	legacyscheduler "go.temporal.io/server/service/worker/scheduler"
 	"go.uber.org/mock/gomock"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // schedulerSuite sets up a suite that has a basic CHASM tree ready
@@ -38,60 +39,72 @@ type schedulerSuite struct {
 	timeSource      *clock.EventTimeSource
 	nodePathEncoder chasm.NodePathEncoder
 	logger          log.Logger
-
-	addedTasks []tasks.Task
 }
 
 // SetupSuite initializes the CHASM tree to a default scheduler.
 func (s *schedulerSuite) SetupTest() {
 	s.Assertions = require.New(s.T())
 	s.ProtoAssertions = protorequire.New(s.T())
-	s.addedTasks = make([]tasks.Task, 0)
 
 	s.controller = gomock.NewController(s.T())
-	s.nodeBackend = chasm.NewMockNodeBackend(s.controller)
 	s.specProcessor = scheduler.NewMockSpecProcessor(s.controller)
 	s.mockEngine = chasm.NewMockEngine(s.controller)
 	s.logger = testlogger.NewTestLogger(s.T(), testlogger.FailOnExpectedErrorOnly)
 	s.nodePathEncoder = chasm.DefaultPathEncoder
 
 	s.registry = chasm.NewRegistry(s.logger)
-	err := s.registry.Register(&scheduler.Library{})
+	err := s.registry.Register(newTestLibrary(s.logger, s.specProcessor))
+	s.NoError(err)
+
+	// Register the Core library as well, which we use for Visibility.
+	err = s.registry.Register(&chasm.CoreLibrary{})
 	s.NoError(err)
 
 	// Advance here, because otherwise ctx.Now().IsZero() will be true.
 	s.timeSource = clock.NewEventTimeSource()
-	s.timeSource.Update(time.Now())
+	now := time.Now()
+	s.timeSource.Update(now)
 
 	// Stub NodeBackend for NewEmptytree
 	tv := testvars.New(s.T())
-	s.nodeBackend.EXPECT().NextTransitionCount().Return(int64(2)).AnyTimes()
-	s.nodeBackend.EXPECT().GetCurrentVersion().Return(int64(1)).AnyTimes()
-	s.nodeBackend.EXPECT().UpdateWorkflowStateStatus(gomock.Any(), gomock.Any()).Return(true, nil).AnyTimes()
-	s.nodeBackend.EXPECT().GetWorkflowKey().Return(tv.Any().WorkflowKey()).AnyTimes()
-	s.nodeBackend.EXPECT().IsWorkflow().Return(false).AnyTimes()
-	currentVT := &persistencespb.VersionedTransition{
-		NamespaceFailoverVersion: 1,
-		TransitionCount:          1,
+	s.nodeBackend = &chasm.MockNodeBackend{
+		HandleNextTransitionCount: func() int64 { return 2 },
+		HandleGetCurrentVersion:   func() int64 { return 1 },
+		HandleGetWorkflowKey:      tv.Any().WorkflowKey,
+		HandleIsWorkflow:          func() bool { return false },
+		HandleCurrentVersionedTransition: func() *persistencespb.VersionedTransition {
+			return &persistencespb.VersionedTransition{
+				NamespaceFailoverVersion: 1,
+				TransitionCount:          1,
+			}
+		},
 	}
-	s.nodeBackend.EXPECT().CurrentVersionedTransition().Return(currentVT).AnyTimes()
-
-	// Collect all tasks added for verification.
-	//
-	// TODO: eventually, when we have more testing framework support for CHASM, we
-	// should test the framework-level tasks. The verifications here are a bit lossy,
-	// because CHASM's already converted logical tasks to physical tasks during
-	// CloseTransaction.
-	s.nodeBackend.EXPECT().AddTasks(gomock.Any()).
-		Do(func(addedTask tasks.Task) {
-			s.addedTasks = append(s.addedTasks, addedTask)
-		}).
-		AnyTimes()
 
 	s.node = chasm.NewEmptyTree(s.registry, s.timeSource, s.nodeBackend, s.nodePathEncoder, s.logger)
 	ctx := s.newMutableContext()
 	s.scheduler = scheduler.NewScheduler(ctx, namespace, namespaceID, scheduleID, defaultSchedule(), nil)
 	s.node.SetRootComponent(s.scheduler)
+
+	// Advance Generator's high water mark to 'now'.
+	generator := s.scheduler.Generator.Get(ctx)
+	generator.LastProcessedTime = timestamppb.New(now)
+
+	// Set up future action times.
+	futureTime := now.Add(time.Hour)
+	s.specProcessor.EXPECT().NextTime(s.scheduler, gomock.Any()).Return(legacyscheduler.GetNextTimeResult{
+		Next:    futureTime,
+		Nominal: futureTime,
+	}, nil).MaxTimes(1)
+	s.specProcessor.EXPECT().NextTime(s.scheduler, gomock.Any()).Return(legacyscheduler.GetNextTimeResult{}, nil).AnyTimes()
+
+	// Allow ProcessTimeRange to be called once during setup.
+	s.specProcessor.EXPECT().ProcessTimeRange(
+		gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+	).Return(&scheduler.ProcessedTimeRange{
+		NextWakeupTime: futureTime,
+		LastActionTime: now,
+	}, nil).Times(1)
+
 	_, err = s.node.CloseTransaction()
 	s.NoError(err)
 }
@@ -100,10 +113,12 @@ func (s *schedulerSuite) SetupTest() {
 // transaction with the given visibilityTime.
 func (s *schedulerSuite) hasTask(task any, visibilityTime time.Time) bool {
 	taskType := reflect.TypeOf(task)
-	for _, task := range s.addedTasks {
-		if reflect.TypeOf(task) == taskType &&
-			task.GetVisibilityTime().Equal(visibilityTime) {
-			return true
+	for _, tasks := range s.nodeBackend.TasksByCategory {
+		for _, task := range tasks {
+			if reflect.TypeOf(task) == taskType &&
+				task.GetVisibilityTime().Equal(visibilityTime) {
+				return true
+			}
 		}
 	}
 

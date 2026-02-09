@@ -100,6 +100,22 @@ func (ch *commandHandler) HandleScheduleCommand(
 		}
 	}
 
+	if err := timestamp.ValidateAndCapProtoDuration(attrs.ScheduleToStartTimeout); err != nil {
+		return workflow.FailWorkflowTaskError{
+			Cause: enumspb.WORKFLOW_TASK_FAILED_CAUSE_BAD_SCHEDULE_NEXUS_OPERATION_ATTRIBUTES,
+			Message: fmt.Sprintf(
+				"ScheduleNexusOperationCommandAttributes.ScheduleToStartTimeout is invalid: %v", err),
+		}
+	}
+
+	if err := timestamp.ValidateAndCapProtoDuration(attrs.StartToCloseTimeout); err != nil {
+		return workflow.FailWorkflowTaskError{
+			Cause: enumspb.WORKFLOW_TASK_FAILED_CAUSE_BAD_SCHEDULE_NEXUS_OPERATION_ATTRIBUTES,
+			Message: fmt.Sprintf(
+				"ScheduleNexusOperationCommandAttributes.StartToCloseTimeout is invalid: %v", err),
+		}
+	}
+
 	if !validator.IsValidPayloadSize(attrs.Input.Size()) {
 		return workflow.FailWorkflowTaskError{
 			Cause:             enumspb.WORKFLOW_TASK_FAILED_CAUSE_BAD_SCHEDULE_NEXUS_OPERATION_ATTRIBUTES,
@@ -109,9 +125,12 @@ func (ch *commandHandler) HandleScheduleCommand(
 	}
 
 	headerLength := 0
+	lowerCaseHeader := make(map[string]string, len(attrs.NexusHeader))
 	for k, v := range attrs.NexusHeader {
-		headerLength += len(k) + len(v)
-		if slices.Contains(ch.config.DisallowedOperationHeaders(), strings.ToLower(k)) {
+		lowerK := strings.ToLower(k)
+		lowerCaseHeader[lowerK] = v
+		headerLength += len(lowerK) + len(v)
+		if slices.Contains(ch.config.DisallowedOperationHeaders(), lowerK) {
 			return workflow.FailWorkflowTaskError{
 				Cause:   enumspb.WORKFLOW_TASK_FAILED_CAUSE_BAD_SCHEDULE_NEXUS_OPERATION_ATTRIBUTES,
 				Message: fmt.Sprintf("ScheduleNexusOperationCommandAttributes.NexusHeader contains a disallowed header key: %q", k),
@@ -149,6 +168,20 @@ func (ch *commandHandler) HandleScheduleCommand(
 		attrs.ScheduleToCloseTimeout = durationpb.New(maxTimeout)
 	}
 
+	// Trim secondary timeouts to the primary timeout.
+	scheduleToCloseTimeout := attrs.ScheduleToCloseTimeout.AsDuration()
+	scheduleToStartTimeout := attrs.ScheduleToStartTimeout.AsDuration()
+	startToCloseTimeout := attrs.StartToCloseTimeout.AsDuration()
+
+	if scheduleToCloseTimeout > 0 {
+		if scheduleToStartTimeout > scheduleToCloseTimeout {
+			attrs.ScheduleToStartTimeout = attrs.ScheduleToCloseTimeout
+		}
+		if startToCloseTimeout > scheduleToCloseTimeout {
+			attrs.StartToCloseTimeout = attrs.ScheduleToCloseTimeout
+		}
+	}
+
 	event := ms.AddHistoryEvent(enumspb.EVENT_TYPE_NEXUS_OPERATION_SCHEDULED, func(he *historypb.HistoryEvent) {
 		he.Attributes = &historypb.HistoryEvent_NexusOperationScheduledEventAttributes{
 			NexusOperationScheduledEventAttributes: &historypb.NexusOperationScheduledEventAttributes{
@@ -158,7 +191,9 @@ func (ch *commandHandler) HandleScheduleCommand(
 				Operation:                    attrs.Operation,
 				Input:                        attrs.Input,
 				ScheduleToCloseTimeout:       attrs.ScheduleToCloseTimeout,
-				NexusHeader:                  attrs.NexusHeader,
+				ScheduleToStartTimeout:       attrs.ScheduleToStartTimeout,
+				StartToCloseTimeout:          attrs.StartToCloseTimeout,
+				NexusHeader:                  lowerCaseHeader,
 				RequestId:                    uuid.NewString(),
 				WorkflowTaskCompletedEventId: workflowTaskCompletedEventID,
 			},

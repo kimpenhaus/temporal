@@ -11,17 +11,19 @@ import (
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/server/api/historyservice/v1"
+	"go.temporal.io/server/api/matchingservice/v1"
+	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/definition"
-	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/enums"
 	"go.temporal.io/server/common/locks"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/persistence"
-	"go.temporal.io/server/common/persistence/visibility/manager"
 	"go.temporal.io/server/common/primitives"
+	"go.temporal.io/server/common/softassert"
 	"go.temporal.io/server/common/tasktoken"
+	"go.temporal.io/server/common/worker_versioning"
 	"go.temporal.io/server/service/history/api"
 	"go.temporal.io/server/service/history/consts"
 	historyi "go.temporal.io/server/service/history/interfaces"
@@ -52,12 +54,12 @@ type Starter struct {
 	metricsHandler             metrics.Handler
 	shardContext               historyi.ShardContext
 	workflowConsistencyChecker api.WorkflowConsistencyChecker
+	matchingClient             matchingservice.MatchingServiceClient
 	tokenSerializer            *tasktoken.Serializer
-	visibilityManager          manager.VisibilityManager
 	request                    *historyservice.StartWorkflowExecutionRequest
 	namespace                  *namespace.Namespace
 	createOrUpdateLeaseFn      api.CreateOrUpdateLeaseFunc
-	enableRequestIdRefLinks    dynamicconfig.BoolPropertyFn
+	versionMembershipCache     worker_versioning.VersionMembershipCache
 }
 
 // creationParams is a container for all information obtained from creating the uncommitted execution.
@@ -84,11 +86,12 @@ func NewStarter(
 	shardContext historyi.ShardContext,
 	workflowConsistencyChecker api.WorkflowConsistencyChecker,
 	tokenSerializer *tasktoken.Serializer,
-	visibilityManager manager.VisibilityManager,
 	request *historyservice.StartWorkflowExecutionRequest,
+	matchingClient matchingservice.MatchingServiceClient,
+	versionMembershipCache worker_versioning.VersionMembershipCache,
 	createLeaseFn api.CreateOrUpdateLeaseFunc,
 ) (*Starter, error) {
-	namespaceEntry, err := api.GetActiveNamespace(shardContext, namespace.ID(request.GetNamespaceId()))
+	namespaceEntry, err := api.GetActiveNamespace(shardContext, namespace.ID(request.GetNamespaceId()), request.StartRequest.WorkflowId)
 	if err != nil {
 		return nil, err
 	}
@@ -98,12 +101,12 @@ func NewStarter(
 		metricsHandler:             nil,
 		shardContext:               shardContext,
 		workflowConsistencyChecker: workflowConsistencyChecker,
+		matchingClient:             matchingClient,
 		tokenSerializer:            tokenSerializer,
-		visibilityManager:          visibilityManager,
 		request:                    request,
 		namespace:                  namespaceEntry,
 		createOrUpdateLeaseFn:      createLeaseFn,
-		enableRequestIdRefLinks:    shardContext.GetConfig().EnableRequestIdRefLinks,
+		versionMembershipCache:     versionMembershipCache,
 	}, nil
 }
 
@@ -128,6 +131,12 @@ func (s *Starter) prepare(ctx context.Context) error {
 	)
 
 	err := api.ValidateStartWorkflowExecutionRequest(ctx, request, s.shardContext, s.namespace, "StartWorkflowExecution")
+	if err != nil {
+		return err
+	}
+
+	// Validation for versioning override, if any.
+	err = worker_versioning.ValidateVersioningOverride(ctx, request.GetVersioningOverride(), s.matchingClient, s.versionMembershipCache, request.GetTaskQueue().GetName(), enumspb.TASK_QUEUE_TYPE_WORKFLOW, s.namespace.ID().String())
 	if err != nil {
 		return err
 	}
@@ -178,7 +187,7 @@ func (s *Starter) Invoke(
 		return nil, StartErr, err
 	}
 
-	creationParams, err := s.prepareNewWorkflow(request.GetWorkflowId())
+	creationParams, err := s.prepareNewWorkflow(ctx, request.GetWorkflowId())
 	if err != nil {
 		return nil, StartErr, err
 	}
@@ -216,11 +225,12 @@ func (s *Starter) Invoke(
 func (s *Starter) lockCurrentWorkflowExecution(
 	ctx context.Context,
 ) (historyi.ReleaseWorkflowContextFunc, error) {
-	currentRelease, err := s.workflowConsistencyChecker.GetWorkflowCache().GetOrCreateCurrentWorkflowExecution(
+	currentRelease, err := s.workflowConsistencyChecker.GetWorkflowCache().GetOrCreateCurrentExecution(
 		ctx,
 		s.shardContext,
 		s.namespace.ID(),
 		s.request.StartRequest.WorkflowId,
+		chasm.WorkflowArchetypeID,
 		locks.PriorityHigh,
 	)
 	if err != nil {
@@ -231,7 +241,7 @@ func (s *Starter) lockCurrentWorkflowExecution(
 
 // prepareNewWorkflow creates a new workflow context, and closes its mutable state transaction as snapshot.
 // It returns the creationContext which can later be used to insert into the executions table.
-func (s *Starter) prepareNewWorkflow(workflowID string) (*creationParams, error) {
+func (s *Starter) prepareNewWorkflow(ctx context.Context, workflowID string) (*creationParams, error) {
 	runID := primitives.NewUUID().String()
 	mutableState, err := api.NewWorkflowWithSignal(
 		s.shardContext,
@@ -252,16 +262,25 @@ func (s *Starter) prepareNewWorkflow(workflowID string) (*creationParams, error)
 
 	workflowTaskInfo := mutableState.GetStartedWorkflowTask()
 	if s.requestEagerStart() && workflowTaskInfo == nil {
-		return nil, serviceerror.NewInternal("unexpected error: mutable state did not have a started workflow task")
+		return nil, softassert.UnexpectedInternalErr(
+			s.shardContext.GetLogger(),
+			"unexpected error: mutable state did not have a started workflow task",
+			nil,
+		)
 	}
 	workflowSnapshot, eventBatches, err := mutableState.CloseTransactionAsSnapshot(
+		ctx,
 		historyi.TransactionPolicyActive,
 	)
 	if err != nil {
 		return nil, err
 	}
 	if len(eventBatches) != 1 {
-		return nil, serviceerror.NewInternal("unable to create 1st event batch")
+		return nil, softassert.UnexpectedInternalErr(
+			s.shardContext.GetLogger(),
+			"unable to create 1st event batch",
+			nil,
+		)
 	}
 
 	return &creationParams{
@@ -663,6 +682,8 @@ func (s *Starter) handleUseExistingWorkflowOnConflictOptions(
 					requestID,
 					completionCallbacks,
 					links,
+					"",  // identity
+					nil, // priority
 				)
 				return api.UpdateWorkflowWithoutWorkflowTask, err
 			},
@@ -739,15 +760,6 @@ func (s *Starter) generateResponse(
 		}, nil
 	}
 
-	if err := api.ProcessOutgoingSearchAttributes(
-		shardCtx.GetSearchAttributesProvider(),
-		shardCtx.GetSearchAttributesMapperProvider(),
-		historyEvents,
-		s.namespace.Name(),
-		s.visibilityManager); err != nil {
-		return nil, err
-	}
-
 	clock, err := shardCtx.NewVectorClock()
 	if err != nil {
 		return nil, err
@@ -811,9 +823,6 @@ func (s *Starter) generateStartedEventRefLink(runID string) *commonpb.Link {
 }
 
 func (s *Starter) generateRequestIdRefLink(runID string) *commonpb.Link {
-	if !s.enableRequestIdRefLinks() {
-		return s.generateStartedEventRefLink(runID)
-	}
 	return &commonpb.Link{
 		Variant: &commonpb.Link_WorkflowEvent_{
 			WorkflowEvent: &commonpb.Link_WorkflowEvent{

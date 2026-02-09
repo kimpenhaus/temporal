@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pborman/uuid"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/suite"
 	commandpb "go.temporal.io/api/command/v1"
 	commonpb "go.temporal.io/api/common/v1"
@@ -38,7 +38,7 @@ func (s *TransientTaskSuite) TestTransientWorkflowTaskTimeout() {
 
 	// Start workflow execution
 	request := &workflowservice.StartWorkflowExecutionRequest{
-		RequestId:           uuid.New(),
+		RequestId:           uuid.NewString(),
 		Namespace:           s.Namespace().String(),
 		WorkflowId:          id,
 		WorkflowType:        &commonpb.WorkflowType{Name: wt},
@@ -127,14 +127,14 @@ func (s *TransientTaskSuite) TestTransientWorkflowTaskHistorySize() {
 
 	// Start workflow execution
 	request := &workflowservice.StartWorkflowExecutionRequest{
-		RequestId:           uuid.New(),
+		RequestId:           uuid.NewString(),
 		Namespace:           s.Namespace().String(),
 		WorkflowId:          id,
 		WorkflowType:        &commonpb.WorkflowType{Name: wt},
 		TaskQueue:           &taskqueuepb.TaskQueue{Name: tl, Kind: enumspb.TASK_QUEUE_KIND_NORMAL},
 		Input:               nil,
 		WorkflowRunTimeout:  durationpb.New(100 * time.Second),
-		WorkflowTaskTimeout: durationpb.New(2 * time.Second),
+		WorkflowTaskTimeout: durationpb.New(4 * time.Second), // use a higher timeout as this test uses large payloads.
 		Identity:            identity,
 	}
 
@@ -147,13 +147,13 @@ func (s *TransientTaskSuite) TestTransientWorkflowTaskHistorySize() {
 		RunId:      we.RunId,
 	}
 
-	// start with 2mb limit
-	s.OverrideDynamicConfig(dynamicconfig.HistorySizeSuggestContinueAsNew, 2*1024*1024)
+	// start with 20kb limit
+	s.OverrideDynamicConfig(dynamicconfig.HistorySizeSuggestContinueAsNew, 20*1024)
 
 	// workflow logic
 	stage := 0
 	workflowComplete := false
-	largeValue := make([]byte, 1024*1024)
+	largeValue := make([]byte, 10*1024)
 	// record the values that we see for completed tasks here
 	type fields struct {
 		size    int64
@@ -172,7 +172,7 @@ func (s *TransientTaskSuite) TestTransientWorkflowTaskHistorySize() {
 		stage++
 		switch stage {
 		case 1:
-			s.Less(attrs.HistorySizeBytes, int64(1024*1024))
+			s.Less(attrs.HistorySizeBytes, int64(10*1024))
 			s.False(attrs.SuggestContinueAsNew)
 			// record a large marker
 			sawFields = append(sawFields, fields{size: attrs.HistorySizeBytes, suggest: attrs.SuggestContinueAsNew})
@@ -185,7 +185,7 @@ func (s *TransientTaskSuite) TestTransientWorkflowTaskHistorySize() {
 			}}, nil
 
 		case 2:
-			s.Greater(attrs.HistorySizeBytes, int64(1024*1024))
+			s.Greater(attrs.HistorySizeBytes, int64(10*1024))
 			s.False(attrs.SuggestContinueAsNew)
 			// record another large marker
 			sawFields = append(sawFields, fields{size: attrs.HistorySizeBytes, suggest: attrs.SuggestContinueAsNew})
@@ -198,7 +198,7 @@ func (s *TransientTaskSuite) TestTransientWorkflowTaskHistorySize() {
 			}}, nil
 
 		case 3:
-			s.Greater(attrs.HistorySizeBytes, int64(2048*1024))
+			s.Greater(attrs.HistorySizeBytes, int64(20*1024))
 			s.True(attrs.SuggestContinueAsNew)
 			failedTaskSawSize = attrs.HistorySizeBytes
 			// fail workflow task and we'll get a transient one
@@ -330,7 +330,7 @@ func (s *TransientTaskSuite) TestNoTransientWorkflowTaskAfterFlushBufferedEvents
 
 	// Start workflow execution
 	request := &workflowservice.StartWorkflowExecutionRequest{
-		RequestId:           uuid.New(),
+		RequestId:           uuid.NewString(),
 		Namespace:           s.Namespace().String(),
 		WorkflowId:          id,
 		WorkflowType:        &commonpb.WorkflowType{Name: wt},
