@@ -9,10 +9,8 @@ import (
 	"maps"
 	"os"
 	"regexp"
-	"strconv"
 	"time"
 
-	"github.com/dgryski/go-farm"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
@@ -346,30 +344,7 @@ func (s *FunctionalTestBase) initAssertions() {
 
 // checkTestShard supports test sharding based on environment variables.
 func (s *FunctionalTestBase) checkTestShard() {
-	totalStr := os.Getenv("TEST_TOTAL_SHARDS")
-	indexStr := os.Getenv("TEST_SHARD_INDEX")
-	if totalStr == "" || indexStr == "" {
-		return
-	}
-	total, err := strconv.Atoi(totalStr)
-	if err != nil || total < 1 {
-		s.T().Fatal("Couldn't convert TEST_TOTAL_SHARDS")
-	}
-	index, err := strconv.Atoi(indexStr)
-	if err != nil || index < 0 || index >= total {
-		s.T().Fatal("Couldn't convert TEST_SHARD_INDEX")
-	}
-
-	salt := os.Getenv("TEST_SHARD_SALT")
-	if salt == "" {
-		s.T().Fatal("TEST_SHARD_SALT must be set when sharding is enabled")
-	}
-	nameToHash := s.T().Name() + salt
-	testIndex := int(farm.Fingerprint32([]byte(nameToHash))) % total
-	if testIndex != index {
-		s.T().Skipf("Skipping %s in test shard %d/%d (it runs in %d)", s.T().Name(), index+1, total, testIndex+1)
-	}
-	s.T().Logf("Running %s in test shard %d/%d", s.T().Name(), index+1, total)
+	checkTestShard(s.T())
 }
 
 func ApplyTestClusterOptions(options []TestClusterOption) TestClusterParams {
@@ -601,11 +576,18 @@ func (s *FunctionalTestBase) OverrideDynamicConfig(setting dynamicconfig.Generic
 	return s.testCluster.host.overrideDynamicConfig(s.T(), setting.Key(), value)
 }
 
-func (s *FunctionalTestBase) InjectHook(key testhooks.Key, value any) (cleanup func()) {
-	if s.isShared {
-		s.T().Fatalf("InjectHook cannot be called on a shared cluster; use testcore.WithDedicatedCluster()")
+// InjectHook sets a test hook inside the cluster.
+func (s *FunctionalTestBase) InjectHook(hook testhooks.Hook) (cleanup func()) {
+	var scope any
+	switch hook.Scope() {
+	case testhooks.ScopeNamespace:
+		scope = s.NamespaceID()
+	case testhooks.ScopeGlobal:
+		scope = testhooks.GlobalScope
+	default:
+		s.T().Fatalf("InjectHook: unknown scope %v", hook.Scope())
 	}
-	return s.testCluster.host.injectHook(s.T(), key, value)
+	return s.testCluster.host.injectHook(s.T(), hook, scope)
 }
 
 // CloseShard closes the shard that contains the given workflow.
@@ -630,55 +612,18 @@ func (s *FunctionalTestBase) GetNamespaceID(namespace string) string {
 }
 
 func (s *FunctionalTestBase) RunTestWithMatchingBehavior(subtest func()) {
-	for _, forcePollForward := range []bool{false, true} {
-		for _, forceTaskForward := range []bool{false, true} {
-			for _, forceAsync := range []bool{false, true} {
-				name := "NoTaskForward"
-				if forceTaskForward {
-					// force two levels of forwarding
-					name = "ForceTaskForward"
-				}
-				if forcePollForward {
-					name += "ForcePollForward"
-				} else {
-					name += "NoPollForward"
-				}
-				if forceAsync {
-					name += "ForceAsync"
-				} else {
-					name += "AllowSync"
-				}
-
-				s.Run(
-					name, func() {
-						if forceTaskForward || forcePollForward {
-							s.OverrideDynamicConfig(dynamicconfig.MatchingNumTaskqueueReadPartitions, 13)
-							s.OverrideDynamicConfig(dynamicconfig.MatchingNumTaskqueueWritePartitions, 13)
-						} else {
-							s.OverrideDynamicConfig(dynamicconfig.MatchingNumTaskqueueReadPartitions, 1)
-							s.OverrideDynamicConfig(dynamicconfig.MatchingNumTaskqueueWritePartitions, 1)
-						}
-						if forceTaskForward {
-							s.InjectHook(testhooks.MatchingLBForceWritePartition, 11)
-						} else {
-							s.InjectHook(testhooks.MatchingLBForceWritePartition, 0)
-						}
-						if forcePollForward {
-							s.InjectHook(testhooks.MatchingLBForceReadPartition, 5)
-						} else {
-							s.InjectHook(testhooks.MatchingLBForceReadPartition, 0)
-						}
-						if forceAsync {
-							s.InjectHook(testhooks.MatchingDisableSyncMatch, true)
-						} else {
-							s.InjectHook(testhooks.MatchingDisableSyncMatch, false)
-						}
-
-						subtest()
-					},
-				)
+	for _, behavior := range AllMatchingBehaviors() {
+		s.Run(behavior.Name(), func() {
+			if behavior.ForceTaskForward || behavior.ForcePollForward {
+				s.OverrideDynamicConfig(dynamicconfig.MatchingNumTaskqueueReadPartitions, 13)
+				s.OverrideDynamicConfig(dynamicconfig.MatchingNumTaskqueueWritePartitions, 13)
+			} else {
+				s.OverrideDynamicConfig(dynamicconfig.MatchingNumTaskqueueReadPartitions, 1)
+				s.OverrideDynamicConfig(dynamicconfig.MatchingNumTaskqueueWritePartitions, 1)
 			}
-		}
+			behavior.InjectHooks(s)
+			subtest()
+		})
 	}
 }
 
